@@ -5,20 +5,21 @@
  * The pre-provider dry run captures each such check's per-test results. After
  * the provider, a failing run of the same check is accepted only when the task
  * made things strictly no worse and its own tests pass: every test it targets
- * passes, no test fails that did not fail at baseline, and no baseline test
- * disappeared or became skipped. Everything else keeps today's strict exit-0
+ * passes, no test fails that did not fail at baseline, no test timed out or
+ * was killed, and no baseline test disappeared or became skipped. Everything
+ * else keeps today's strict exit-0
  * judgement, and this module can only turn a strict failure into an
  * acceptance, never the reverse.
  */
 
-import { realpathSync, writeFileSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import {
 	classifyFailedCheck,
 	redactCredentialTokens,
 } from "./check-environment.mjs";
 import {
-	NODE_TEST_REPORTER_SOURCE,
+	NODE_TEST_REPORTER_URL,
 	parseNodeTestReport,
 	parsePytestJunit,
 	readReportFile,
@@ -36,8 +37,8 @@ const NOT_RUN = new Set(["skipped", "todo"]);
  * Compare a candidate run with its baseline.
  *
  * @param {object} options
- * @param {Map<string, {status: string, file: string|null}>} options.baseline
- * @param {Map<string, {status: string, file: string|null}>} options.after
+ * @param {Map<string, {status: string, file: string|null, abnormal: boolean}>} options.baseline
+ * @param {Map<string, {status: string, file: string|null, abnormal: boolean}>} options.after
  * @param {string[]} options.declaredFiles The task's declared repo-relative paths.
  * @returns {{accepted: boolean, reason: string|null, newFailures: string[],
  *   targeted: {total: number, passed: number}}}
@@ -68,6 +69,8 @@ export function compareTestRuns({ baseline, after, declaredFiles }) {
 		targeted,
 	});
 	if (after.size < baseline.size) return result("test_count_dropped");
+	if ([...after.values()].some(({ abnormal }) => abnormal))
+		return result("test_ended_abnormally");
 	for (const [id, { status }] of baseline) {
 		const now = after.get(id);
 		if (now === undefined) return result("baseline_test_missing");
@@ -82,10 +85,17 @@ export function compareTestRuns({ baseline, after, declaredFiles }) {
 	return result(null);
 }
 
+// Credential prefixes glued to an identifier (`test_sk-...`), which the shared
+// word-boundary redactor misses. `sk-` after a letter (`task-...`) is a word.
+const EMBEDDED_CREDENTIAL_RE =
+	/(?:(?<![A-Za-z])sk-[A-Za-z0-9_-]{8,}|github_pat_[A-Za-z0-9_]{8,}|ghp_[A-Za-z0-9]{8,}|bws_[A-Za-z0-9_-]{8,}|(?:AKIA|ASIA)[A-Z0-9]{16})/gu;
+
 /** A test id safe to persist: control characters stripped, redacted, bounded. */
 function recordedId(id) {
 	const visible = id.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ");
-	const redacted = redactCredentialTokens(visible).toString("utf8");
+	const redacted = redactCredentialTokens(visible)
+		.toString("utf8")
+		.replace(EMBEDDED_CREDENTIAL_RE, "[REDACTED]");
 	return redacted.length > RECORDED_ID_CHARS
 		? `${redacted.slice(0, RECORDED_ID_CHARS - 1)}…`
 		: redacted;
@@ -116,9 +126,23 @@ function record(runner, reason, extra = {}) {
 	};
 }
 
-function parseReport(runner, path, checkoutRoots) {
-	const text = readReportFile(path);
-	if (text === null) return null;
+// The runtime directory as created by the host. Check code can write inside it
+// and so could swap it for a link; a report is read only while it is unchanged.
+function directoryIdentity(path) {
+	try {
+		const stat = lstatSync(path);
+		return stat.isDirectory() ? `${stat.dev}:${stat.ino}` : null;
+	} catch {
+		return null;
+	}
+}
+
+function parseReport(plan) {
+	const { runner, reportPath, checkoutRoots, runtime, runtimeIdentity } = plan;
+	if (directoryIdentity(runtime) !== runtimeIdentity) return null;
+	const text = readReportFile(reportPath);
+	if (text === null || directoryIdentity(runtime) !== runtimeIdentity)
+		return null;
 	try {
 		return runner === "pytest"
 			? parsePytestJunit(text)
@@ -190,7 +214,7 @@ export function createDifferentialChecks({ declaredFiles }) {
 				if (result?.success === true) return result;
 				const tests =
 					plan.shellCommand && failedNormally(result)
-						? parseReport(plan.runner, plan.reportPath, plan.checkoutRoots)
+						? parseReport(plan)
 						: null;
 				baselines.set(
 					command,
@@ -216,11 +240,7 @@ export function createDifferentialChecks({ declaredFiles }) {
 			if (environmentFailure(result)) return strict("environment_failure");
 			if (!plan.shellCommand) return strict(plan.reason);
 			if (!failedNormally(result)) return strict("exit_status_unusable");
-			const after = parseReport(
-				plan.runner,
-				plan.reportPath,
-				plan.checkoutRoots,
-			);
+			const after = parseReport(plan);
 			if (!after) return strict("report_unavailable");
 			const verdict = compareTestRuns({
 				baseline: plan.baseline.tests,
@@ -249,21 +269,8 @@ export function createDifferentialChecks({ declaredFiles }) {
 				reason: runner.reason,
 				shellCommand: null,
 			};
-		reports += 1;
-		const extension = runner.runner === "pytest" ? "xml" : "jsonl";
-		const reportPath = join(runtime, `sy-test-report-${reports}.${extension}`);
-		let reporterPath;
-		try {
-			if (runner.runner === "node") {
-				// Check code may write the runtime, so the host writes the reporter
-				// only to a fresh name and never follows a planted link (`wx`).
-				reporterPath = join(runtime, `sy-node-test-reporter-${reports}.mjs`);
-				writeFileSync(reporterPath, NODE_TEST_REPORTER_SOURCE, {
-					flag: "wx",
-					mode: 0o600,
-				});
-			}
-		} catch {
+		const runtimeIdentity = directoryIdentity(runtime);
+		if (runtimeIdentity === null)
 			return {
 				phase,
 				runner: runner.runner,
@@ -272,7 +279,9 @@ export function createDifferentialChecks({ declaredFiles }) {
 				baseline,
 				shellCommand: null,
 			};
-		}
+		reports += 1;
+		const extension = runner.runner === "pytest" ? "xml" : "jsonl";
+		const reportPath = join(runtime, `sy-test-report-${reports}.${extension}`);
 		let checkoutRoots = [checkout];
 		try {
 			checkoutRoots = [...new Set([checkout, realpathSync(checkout)])];
@@ -283,8 +292,13 @@ export function createDifferentialChecks({ declaredFiles }) {
 			reason: null,
 			baseline,
 			reportPath,
+			runtime,
+			runtimeIdentity,
 			checkoutRoots,
-			shellCommand: reportingCommand(runner, { reportPath, reporterPath }),
+			shellCommand: reportingCommand(runner, {
+				reportPath,
+				reporter: NODE_TEST_REPORTER_URL,
+			}),
 		};
 	}
 }

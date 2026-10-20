@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
-	readFileSync,
+	renameSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -21,7 +21,9 @@ import {
 import { tempDir } from "./helpers/tempdir.mjs";
 
 function nodeLines(entries, end = { end: true, count: entries.length }) {
-	return `${[...entries, end].map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+	return `${[...entries.map((entry) => ({ abnormal: false, ...entry })), end]
+		.map((entry) => JSON.stringify(entry))
+		.join("\n")}\n`;
 }
 
 // -- the comparison rule --------------------------------------------------------
@@ -30,7 +32,7 @@ const runOf = (entries) =>
 	new Map(
 		Object.entries(entries).map(([id, status]) => [
 			id,
-			{ status, file: id.split("::")[0] },
+			{ status, file: id.split("::")[0], abnormal: false },
 		]),
 	);
 const BASELINE = runOf({
@@ -109,6 +111,21 @@ test("each guard rail refuses with its own reason", () => {
 		strictEqual(result.accepted, false, reason);
 		strictEqual(result.reason, reason, JSON.stringify(after));
 	}
+});
+
+test("a test that timed out or was killed refuses even a pre-existing failure", () => {
+	const after = runOf({
+		"tests/legacy.py::clock": "failed",
+		"tests/legacy.py::green": "passed",
+		"tests/legacy.py::platform": "skipped",
+		"tests/feature.py::works": "passed",
+	});
+	after.get("tests/legacy.py::clock").abnormal = true;
+	strictEqual(
+		compareTestRuns({ baseline: BASELINE, after, declaredFiles: DECLARED })
+			.reason,
+		"test_ended_abnormally",
+	);
 });
 
 test("a declared file's baseline failure must now pass; its pre-existing skip may stay", () => {
@@ -204,7 +221,9 @@ test("only the dry run's base-tree run of a test-runner check is rewritten", () 
 	const plan = s.plan(CMD, { baseRun: true, testBaseline: true });
 	strictEqual(plan.phase, "baseline");
 	ok(plan.shellCommand.startsWith("node --test-reporter=spec "));
-	ok(existsSync(plan.shellCommand.match(/'--test-reporter=([^']+)'/u)[1]));
+	ok(
+		plan.shellCommand.includes("'--test-reporter=data:text/javascript;base64,"),
+	);
 	// No baseline captured yet: a candidate run is unchanged.
 	strictEqual(s.plan(CMD), null);
 });
@@ -334,32 +353,46 @@ test("recorded ids are bounded, redacted and free of control characters", () => 
 		"leaks sk-abcdefghijklmnop\u0007 token",
 		"failed",
 	);
+	const glued = entry(s.checkout, "a test_sk-zyxwvutsrqponm", "failed");
+	const word = entry(s.checkout, "a task-identity-binding", "failed");
 	const long = entry(s.checkout, "x".repeat(400), "failed");
-	captureBaseline(s, CMD, [...many, secret, long]);
+	const all = [glued, word, secret, ...many, long];
+	captureBaseline(s, CMD, all);
 	const plan = s.plan(CMD);
-	writeFileSync(plan.reportPath, nodeLines([...many, secret, long]));
+	writeFileSync(plan.reportPath, nodeLines(all));
 	const { differential } = s.checks.judge(plan, CMD, failedRun);
 	strictEqual(differential.reason, "no_targeted_tests");
-	strictEqual(differential.baseline.failedCount, 32);
+	strictEqual(differential.baseline.failedCount, 34);
 	strictEqual(differential.baseline.failed.length, RECORDED_IDS);
 	ok(
 		differential.baseline.failed.every((id) => id.length <= RECORDED_ID_CHARS),
 	);
-	const all = JSON.stringify(differential);
-	ok(!all.includes("sk-abcdefghijklmnop"));
-	ok(!all.includes("\\u0007"));
-	ok(all.includes("[REDACTED]"));
+	const text = JSON.stringify(differential);
+	ok(!text.includes("sk-abcdefghijklmnop"));
+	ok(!text.includes("sk-zyxwvutsrqponm"));
+	ok(text.includes("tests/legacy.test.mjs::a test_[REDACTED]"));
+	ok(text.includes("tests/legacy.test.mjs::a task-identity-binding"));
+	ok(!text.includes("\\u0007"));
 });
 
-test("the host never writes the reporter through a link planted in the runtime", () => {
+test("a report is not read through a runtime directory swapped for a link", () => {
 	const s = session();
-	const target = join(s.runtime, "target.txt");
-	writeFileSync(target, "host file");
-	symlinkSync(target, join(s.runtime, "sy-node-test-reporter-1.mjs"));
 	const plan = s.plan(CMD, { baseRun: true, testBaseline: true });
-	strictEqual(plan.shellCommand, null);
-	strictEqual(plan.reason, "baseline_unavailable");
-	strictEqual(readFileSync(target, "utf8"), "host file");
+	writeFileSync(plan.reportPath, nodeLines([entry(s.checkout, "a", "failed")]));
+	const moved = `${s.runtime}-moved`;
+	renameSync(s.runtime, moved);
+	symlinkSync(moved, s.runtime);
+	s.checks.judge(plan, CMD, failedRun);
+	deepStrictEqual(s.checks.judge(s.plan(CMD), CMD, failedRun).differential, {
+		runner: "node",
+		verdict: "refused",
+		reason: "baseline_unavailable",
+	});
+	// A runtime that is already a link is never planned against.
+	strictEqual(
+		s.plan(CMD, { baseRun: true, testBaseline: true }).shellCommand,
+		null,
+	);
 });
 
 // -- real pytest ------------------------------------------------------------------

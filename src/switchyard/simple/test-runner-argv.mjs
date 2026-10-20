@@ -183,10 +183,11 @@ function verdict(allowed) {
  * reporter.
  *
  * @param {{runner: string, words: string[]}} plan From `testRunnerOf`.
- * @param {{reportPath: string, reporterPath?: string}} paths
+ * @param {{reportPath: string, reporter?: string}} options `reporter` is the
+ *   node `--test-reporter` module specifier.
  * @returns {string}
  */
-export function reportingCommand(plan, { reportPath, reporterPath }) {
+export function reportingCommand(plan, { reportPath, reporter }) {
 	const [head, ...rest] = plan.words;
 	if (plan.runner === "pytest")
 		return [
@@ -201,7 +202,7 @@ export function reportingCommand(plan, { reportPath, reporterPath }) {
 			head,
 			"--test-reporter=spec",
 			"--test-reporter-destination=stdout",
-			shellQuote(`--test-reporter=${reporterPath}`),
+			shellQuote(`--test-reporter=${reporter}`),
 			shellQuote(`--test-reporter-destination=${reportPath}`),
 			...rest,
 		].join(" ");

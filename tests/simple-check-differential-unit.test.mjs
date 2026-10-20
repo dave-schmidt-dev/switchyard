@@ -13,7 +13,7 @@ import {
 import { join } from "node:path";
 import { test } from "node:test";
 import {
-	NODE_TEST_REPORTER_SOURCE,
+	NODE_TEST_REPORTER_URL,
 	nodeTestJsonReporter,
 	parseNodeTestReport,
 	parsePytestJunit,
@@ -108,7 +108,7 @@ test("the reporting command only adds reporter flags, quoted for the shell", () 
 	strictEqual(
 		reportingCommand(testRunnerOf("node --test tests/a.test.mjs"), {
 			reportPath: "/r/out.jsonl",
-			reporterPath: "/r/rep.mjs",
+			reporter: "/r/rep.mjs",
 		}),
 		"node --test-reporter=spec --test-reporter-destination=stdout '--test-reporter=/r/rep.mjs' '--test-reporter-destination=/r/out.jsonl' --test tests/a.test.mjs",
 	);
@@ -130,30 +130,37 @@ test("pytest junit maps failure and error to failed, skip and xfail to skipped",
 		"tests/test_a.py::tests.test_a::test_ok": {
 			status: "passed",
 			file: "tests/test_a.py",
+			abnormal: false,
 		},
 		"tests/test_a.py::tests.test_a::test_bad": {
 			status: "failed",
 			file: "tests/test_a.py",
+			abnormal: false,
 		},
 		"tests/test_a.py::tests.test_a::test_skip": {
 			status: "skipped",
 			file: "tests/test_a.py",
+			abnormal: false,
 		},
 		"tests/test_a.py::tests.test_a::test_xf": {
 			status: "skipped",
 			file: "tests/test_a.py",
+			abnormal: false,
 		},
-		"tests/test_a.py::tests.test_a::test_p[a&b <1>]": {
+		"tests/test_a.py::tests.test_a::test_p[a&b <1\\>]": {
 			status: "passed",
 			file: "tests/test_a.py",
+			abnormal: false,
 		},
 		"tests/test_a.py::tests.test_a.TestK::test_m": {
 			status: "passed",
 			file: "tests/test_a.py",
+			abnormal: false,
 		},
 		"tests/test_broken.py::::tests.test_broken": {
 			status: "failed",
 			file: "tests/test_broken.py",
+			abnormal: false,
 		},
 	});
 });
@@ -174,6 +181,16 @@ test("a malformed, truncated or ambiguous junit report is refused whole", () => 
 		'<testsuites><testsuite tests="0"></testsuite></testsuites><failure/>',
 		"<testsuites></testsuites>",
 		"not xml at all",
+		`${PYTEST_XML}trailing`,
+		`junk${PYTEST_XML}`,
+		`${PYTEST_XML}<testsuites><testsuite tests="0"></testsuite></testsuites>`,
+		PYTEST_XML.replace("&gt;       assert", "&bogus;       assert"),
+		PYTEST_XML.replace("&gt;       assert", "& assert"),
+		// A skipped call whose teardown errored is neither skipped nor failed.
+		PYTEST_XML.replace(
+			"tests/test_a.py:6: x</skipped>",
+			'tests/test_a.py:6: x</skipped><error message="teardown">boom</error>',
+		).replace('errors="1"', 'errors="2"'),
 	];
 	for (const xml of cases)
 		throws(() => parsePytestJunit(xml), { code: "report_invalid" });
@@ -182,7 +199,9 @@ test("a malformed, truncated or ambiguous junit report is refused whole", () => 
 const ROOT = "/private/var/run/checkout";
 
 function nodeLines(entries, end = { end: true, count: entries.length }) {
-	return `${[...entries, end].map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+	return `${[...entries.map((entry) => ({ abnormal: false, ...entry })), end]
+		.map((entry) => JSON.stringify(entry))
+		.join("\n")}\n`;
 }
 
 test("node JSON-lines report ids are checkout-relative suite paths", () => {
@@ -211,11 +230,59 @@ test("node JSON-lines report ids are checkout-relative suite paths", () => {
 		["/var/run/checkout", ROOT],
 	);
 	deepStrictEqual(Object.fromEntries(tests), {
-		"t/c.test.mjs::grp > in bad": { status: "failed", file: "t/c.test.mjs" },
-		"t/c.test.mjs::grp": { status: "failed", file: "t/c.test.mjs" },
-		"t/c.test.mjs::todo": { status: "todo", file: "t/c.test.mjs" },
-		"::global": { status: "passed", file: null },
+		"t/c.test.mjs::grp > in bad": {
+			status: "failed",
+			file: "t/c.test.mjs",
+			abnormal: false,
+		},
+		"t/c.test.mjs::grp": {
+			status: "failed",
+			file: "t/c.test.mjs",
+			abnormal: false,
+		},
+		"t/c.test.mjs::todo": {
+			status: "todo",
+			file: "t/c.test.mjs",
+			abnormal: false,
+		},
+		"::global": { status: "passed", file: null, abnormal: false },
 	});
+});
+
+test("identity separators inside names and files are escaped, so ids never collide", () => {
+	const at = (file, path) => ({
+		path,
+		file: `${ROOT}/${file}`,
+		type: "test",
+		status: "passed",
+	});
+	const tests = parseNodeTestReport(
+		nodeLines([
+			at("t.mjs", ["a > b"]),
+			at("t.mjs", ["a", "b"]),
+			at("a::b.mjs", ["c"]),
+			at("a.mjs", ["b::c"]),
+			at("t.mjs", ["x\\"]),
+		]),
+		[ROOT],
+	);
+	deepStrictEqual(
+		[...tests.keys()],
+		[
+			"t.mjs::a \\> b",
+			"t.mjs::a > b",
+			"a\\:\\:b.mjs::c",
+			"a.mjs::b\\:\\:c",
+			"t.mjs::x\\\\",
+		],
+	);
+	const pytest = parsePytestJunit(
+		'<testsuite tests="2"><testcase file="a.py" classname="k::x" name="t"/><testcase file="a.py" classname="k" name="x::t"/></testsuite>',
+	);
+	deepStrictEqual(
+		[...pytest.keys()],
+		["a.py::k\\:\\:x::t", "a.py::k::x\\:\\:t"],
+	);
 });
 
 test("a node report without its end line, or naming files outside the checkout, is refused", () => {
@@ -236,6 +303,8 @@ test("a node report without its end line, or naming files outside the checkout, 
 		`${nodeLines([entry])}${JSON.stringify(entry)}\n`,
 		nodeLines([entry]).slice(0, -1),
 		"{not json}\n",
+		`${JSON.stringify(entry)}\n{"end":true,"count":1}\n`,
+		`${JSON.stringify({ ...entry, abnormal: "no" })}\n{"end":true,"count":1}\n`,
 	])
 		throws(() => parseNodeTestReport(text, [ROOT]), { code: "report_invalid" });
 });
@@ -256,17 +325,24 @@ describe("grp", () => { it("in ok", () => {}); it("in bad", () => { throw new Er
 test("parent throws", async (t) => { await t.test("kid", () => {}); throw new Error("parent"); });
 test("skipped", { skip: true }, () => {});
 test("todo", { todo: true }, () => { throw new Error("t"); });
+test("hangs", { timeout: 20 }, () => new Promise((resolve) => setTimeout(resolve, 2000)));
 `,
 	);
-	writeFileSync(join(dir, "reporter.mjs"), NODE_TEST_REPORTER_SOURCE);
+	writeFileSync(
+		join(dir, "killed.test.mjs"),
+		`import { test } from "node:test";
+test("killed", () => { process.kill(process.pid, "SIGKILL"); });
+`,
+	);
 	const report = join(dir, "report.jsonl");
 	const run = spawnSync(
 		process.execPath,
 		[
-			`--test-reporter=${join(dir, "reporter.mjs")}`,
+			`--test-reporter=${NODE_TEST_REPORTER_URL}`,
 			`--test-reporter-destination=${report}`,
 			"--test",
 			"c.test.mjs",
+			"killed.test.mjs",
 		],
 		{
 			cwd: dir,
@@ -279,16 +355,21 @@ test("todo", { todo: true }, () => { throw new Error("t"); });
 	const tests = parseNodeTestReport(readFileSync(report, "utf8"), [dir]);
 	deepStrictEqual(
 		Object.fromEntries(
-			[...tests].map(([id, { status }]) => [id.split("::")[1], status]),
+			[...tests].map(([id, { status, abnormal }]) => [
+				id,
+				abnormal ? `${status}, abnormal` : status,
+			]),
 		),
 		{
-			"grp > in ok": "passed",
-			"grp > in bad": "failed",
-			grp: "failed",
-			"parent throws > kid": "passed",
-			"parent throws": "failed",
-			skipped: "skipped",
-			todo: "todo",
+			"c.test.mjs::grp > in ok": "passed",
+			"c.test.mjs::grp > in bad": "failed",
+			"c.test.mjs::grp": "failed",
+			"c.test.mjs::parent throws > kid": "passed",
+			"c.test.mjs::parent throws": "failed",
+			"c.test.mjs::skipped": "skipped",
+			"c.test.mjs::todo": "todo",
+			"c.test.mjs::hangs": "failed, abnormal",
+			"killed.test.mjs::killed.test.mjs": "failed, abnormal",
 		},
 	);
 });
@@ -306,16 +387,60 @@ test("the reporter rebuilds suite paths from start events", async () => {
 			data: { name: "s", nesting: 0, file: "/f", details: { type: "suite" } },
 		};
 		yield { type: "test:pass", data: { name: "late", nesting: 0, skip: "x" } };
+		yield {
+			type: "test:fail",
+			data: {
+				name: "t",
+				nesting: 0,
+				details: { error: { failureType: "testTimeoutFailure" } },
+			},
+		};
+		yield {
+			type: "test:fail",
+			data: { name: "f", nesting: 0, details: { error: { exitCode: 3 } } },
+		};
 	}
 	const lines = [];
 	for await (const line of nodeTestJsonReporter(events())) lines.push(line);
 	deepStrictEqual(
 		lines.map((line) => JSON.parse(line)),
 		[
-			{ path: ["s", "a"], file: "/f", type: "test", status: "failed" },
-			{ path: ["s"], file: "/f", type: "suite", status: "passed" },
-			{ path: ["late"], file: null, type: "test", status: "skipped" },
-			{ end: true, count: 3 },
+			{
+				path: ["s", "a"],
+				file: "/f",
+				type: "test",
+				status: "failed",
+				abnormal: false,
+			},
+			{
+				path: ["s"],
+				file: "/f",
+				type: "suite",
+				status: "passed",
+				abnormal: false,
+			},
+			{
+				path: ["late"],
+				file: null,
+				type: "test",
+				status: "skipped",
+				abnormal: false,
+			},
+			{
+				path: ["t"],
+				file: null,
+				type: "test",
+				status: "failed",
+				abnormal: true,
+			},
+			{
+				path: ["f"],
+				file: null,
+				type: "test",
+				status: "failed",
+				abnormal: true,
+			},
+			{ end: true, count: 5 },
 		],
 	);
 });

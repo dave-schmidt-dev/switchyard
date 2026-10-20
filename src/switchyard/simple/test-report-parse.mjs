@@ -4,7 +4,10 @@
  * Both parsers return one entry per test identity, or throw a `report_invalid`
  * error: a report that is malformed, incomplete, ambiguous, or names a file
  * outside the checkout never yields a partial set. Statuses are `passed`,
- * `failed`, `skipped` and `todo`.
+ * `failed`, `skipped` and `todo`; `abnormal` marks a failure that ended by a
+ * timeout, a signal or an unexpected process exit rather than by an assertion.
+ * Identity components escape a backslash, `:` and `>`, so two different tests never
+ * share an identity through the `::` and ` > ` separators.
  */
 
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
@@ -92,11 +95,17 @@ function parseTag(body) {
 	return { name, attributes, selfClosing };
 }
 
-/** Element tags in document order; text, comments and declarations are skipped. */
+/**
+ * Element tags and non-blank text runs in document order; comments and
+ * processing instructions are skipped. Text is yielded raw (`{text}`) and
+ * CDATA as `{text, cdata: true}`.
+ */
 function* xmlTags(xml) {
 	let index = 0;
 	for (;;) {
 		const open = xml.indexOf("<", index);
+		const text = xml.slice(index, open === -1 ? xml.length : open);
+		if (text.trim() !== "") yield { text };
 		if (open === -1) return;
 		for (const [start, stop] of [
 			["<!--", "-->"],
@@ -107,6 +116,7 @@ function* xmlTags(xml) {
 				const close = xml.indexOf(stop, open + start.length);
 				if (close === -1) throw invalid("unterminated section");
 				index = close + stop.length;
+				if (start === "<![CDATA[") yield { text: "", cdata: true };
 				break;
 			}
 		}
@@ -135,6 +145,9 @@ function* xmlTags(xml) {
 
 const COUNT = /^\d{1,7}$/u;
 
+/** One identity component with the separator characters escaped. */
+const idPart = (value) => value.replace(/[\\:>]/gu, "\\$&");
+
 function addTest(tests, id, entry) {
 	if (tests.has(id)) throw invalid("duplicate test id");
 	if (tests.size >= MAX_TESTS) throw invalid("too many tests");
@@ -143,11 +156,14 @@ function addTest(tests, id, entry) {
 
 /**
  * Parse pytest's junit XML (`-o junit_family=xunit1`). Identity is
- * `<file>::<classname>::<name>`. The testcase count must equal the sum of the
- * `testsuite tests=` attributes, so a truncated report is refused.
+ * `<file>::<classname>::<name>`. The document must be one root element with
+ * no stray text, and the testcase count must equal the sum of the
+ * `testsuite tests=` attributes, so a truncated report is refused. A testcase
+ * that is both skipped and failed (a skipped call with a teardown error) is
+ * refused rather than given either status.
  *
  * @param {string} xml
- * @returns {Map<string, {status: string, file: string|null}>}
+ * @returns {Map<string, {status: string, file: string|null, abnormal: boolean}>}
  */
 export function parsePytestJunit(xml) {
 	if (typeof xml !== "string") throw invalid("not text");
@@ -156,10 +172,12 @@ export function parsePytestJunit(xml) {
 	let declared = 0;
 	let suites = 0;
 	let current = null;
+	let rootClosed = false;
 	const finish = () => {
 		const { attributes } = current;
 		if (typeof attributes.name !== "string" || attributes.name === "")
 			throw invalid("testcase name");
+		if (current.failed && current.skipped) throw invalid("mixed outcome");
 		const file = attributes.file ?? null;
 		const classname = attributes.classname ?? "";
 		const status = current.failed
@@ -167,16 +185,24 @@ export function parsePytestJunit(xml) {
 			: current.skipped
 				? "skipped"
 				: "passed";
-		addTest(tests, `${file ?? ""}::${classname}::${attributes.name}`, {
-			status,
-			file,
-		});
+		addTest(
+			tests,
+			`${idPart(file ?? "")}::${idPart(classname)}::${idPart(attributes.name)}`,
+			{ status, file, abnormal: false },
+		);
 		current = null;
 	};
 	for (const tag of xmlTags(xml)) {
+		if (rootClosed) throw invalid("content after root");
+		if (tag.text !== undefined) {
+			if (open.length === 0) throw invalid("text outside root");
+			if (!tag.cdata) decodeEntities(tag.text);
+			continue;
+		}
 		if (tag.closing) {
 			if (open.pop() !== tag.name) throw invalid("mismatched close");
 			if (tag.name === "testcase") finish();
+			rootClosed = open.length === 0;
 			continue;
 		}
 		if (
@@ -202,6 +228,7 @@ export function parsePytestJunit(xml) {
 		}
 		if (tag.selfClosing) {
 			if (tag.name === "testcase") finish();
+			rootClosed = open.length === 0;
 		} else open.push(tag.name);
 	}
 	if (open.length > 0 || current) throw invalid("unterminated document");
@@ -231,7 +258,7 @@ function checkoutRelative(file, checkoutRoots) {
  *
  * @param {string} text
  * @param {string[]} checkoutRoots Absolute checkout paths, including its realpath.
- * @returns {Map<string, {status: string, file: string|null}>}
+ * @returns {Map<string, {status: string, file: string|null, abnormal: boolean}>}
  */
 export function parseNodeTestReport(text, checkoutRoots) {
 	if (typeof text !== "string") throw invalid("not text");
@@ -253,12 +280,13 @@ export function parseNodeTestReport(text, checkoutRoots) {
 			ended = true;
 			continue;
 		}
-		const { path, file, status } = entry ?? {};
+		const { path, file, status, abnormal } = entry ?? {};
 		if (
 			!Array.isArray(path) ||
 			path.length === 0 ||
 			!path.every((name) => typeof name === "string") ||
 			!NODE_STATUSES.has(status) ||
+			typeof abnormal !== "boolean" ||
 			(file !== null && typeof file !== "string")
 		)
 			throw invalid("entry shape");
@@ -266,10 +294,11 @@ export function parseNodeTestReport(text, checkoutRoots) {
 			file === null ? null : checkoutRelative(file, checkoutRoots);
 		if (file !== null && relative === null)
 			throw invalid("file outside checkout");
-		addTest(tests, `${relative ?? ""}::${path.join(" > ")}`, {
-			status,
-			file: relative,
-		});
+		addTest(
+			tests,
+			`${idPart(relative ?? "")}::${path.map(idPart).join(" > ")}`,
+			{ status, file: relative, abnormal },
+		);
 	}
 	if (!ended) throw invalid("incomplete");
 	return tests;
@@ -280,10 +309,12 @@ export function parseNodeTestReport(text, checkoutRoots) {
  * suite, then `{"end":true,"count":N}`. It rebuilds each test's suite path
  * with the same `test:start` nesting logic as node's own junit reporter, but
  * keeps every node's own result: junit turns a parent test into a
- * `<testsuite>` and drops a failure thrown by the parent itself.
+ * `<testsuite>` and drops a failure thrown by the parent itself. A failure is
+ * `abnormal` when the test timed out, or its file's process was killed by a
+ * signal or exited with a code other than 0 or 1.
  *
- * It is serialized into the checker runtime as a standalone module, so it
- * must not reference anything outside its own body.
+ * It is loaded from a `data:` URL as a standalone module, so it must not
+ * reference anything outside its own body.
  *
  * @param {AsyncIterable<{type: string, data: object}>} source
  */
@@ -302,6 +333,13 @@ export async function* nodeTestJsonReporter(source) {
 			const path = stack.map((node) => String(node.name));
 			if (stack[stack.length - 1].nesting === data.nesting) stack.pop();
 			const marked = (value) => value !== undefined && value !== false;
+			const error = data.details?.error;
+			const exitCode = error?.exitCode;
+			const abnormal =
+				event.type === "test:fail" &&
+				(error?.failureType === "testTimeoutFailure" ||
+					typeof error?.signal === "string" ||
+					(Number.isInteger(exitCode) && exitCode !== 0 && exitCode !== 1));
 			const status = marked(data.todo)
 				? "todo"
 				: marked(data.skip)
@@ -315,11 +353,17 @@ export async function* nodeTestJsonReporter(source) {
 				file: typeof data.file === "string" ? data.file : null,
 				type: data.details?.type === "suite" ? "suite" : "test",
 				status,
+				abnormal,
 			})}\n`;
 		}
 	}
 	yield `${JSON.stringify({ end: true, count })}\n`;
 }
 
-/** Module source written into the checker runtime for `--test-reporter`. */
-export const NODE_TEST_REPORTER_SOURCE = `export default ${nodeTestJsonReporter.toString()};\n`;
+/**
+ * `--test-reporter` specifier for `nodeTestJsonReporter`: a `data:` URL, so
+ * the host never writes a module where check code could redirect the write.
+ */
+export const NODE_TEST_REPORTER_URL = `data:text/javascript;base64,${Buffer.from(
+	`export default ${nodeTestJsonReporter.toString()};\n`,
+).toString("base64")}`;

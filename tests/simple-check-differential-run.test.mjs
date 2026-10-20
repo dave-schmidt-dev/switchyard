@@ -172,6 +172,14 @@ test("a candidate that adds a new failure is refused", {
 		check.differential.after.newFailures[0],
 		"tests/legacy.test.mjs::still green",
 	);
+	// A refused differential keeps the soft check failure that waterfalls.
+	strictEqual(
+		classifyAttemptFailure({
+			result,
+			accountability: result.accountability,
+		}).severity,
+		"soft",
+	);
 });
 
 test("an intentional red check stays strict and still waterfalls", {
