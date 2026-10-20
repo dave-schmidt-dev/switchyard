@@ -16,8 +16,8 @@ import {
 	sanitizeFailureDetails,
 	sanitizeFailureMetadata,
 } from "../adapter/exec-error.mjs";
-import { projectRunFailureForDisk } from "../adapter/exec-error-sanitize.mjs";
 import { boundProviderLifecycleSnapshot } from "../adapter/provider-lifecycle.mjs";
+import { projectRunFailureForDisk } from "../adapter/run-failure-disk.mjs";
 import {
 	CLI_CONTRACT_FAILURE_REASON,
 	checkTargetCliContract,

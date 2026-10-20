@@ -4,7 +4,7 @@ import { dirname, resolve } from "node:path";
 import {
 	projectRunFailureForDisk,
 	upgradeRunFailureFromDisk,
-} from "../adapter/exec-error-sanitize.mjs";
+} from "../adapter/run-failure-disk.mjs";
 import { SUPPORTED_OUTCOME_READER_VERSION } from "../outcome/schema.mjs";
 import {
 	CURRENT_SCHEMA_VERSION,
