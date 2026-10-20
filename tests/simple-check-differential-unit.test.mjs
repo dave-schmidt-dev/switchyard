@@ -326,6 +326,7 @@ test("parent throws", async (t) => { await t.test("kid", () => {}); throw new Er
 test("skipped", { skip: true }, () => {});
 test("todo", { todo: true }, () => { throw new Error("t"); });
 test("hangs", { timeout: 20 }, () => new Promise((resolve) => setTimeout(resolve, 2000)));
+test("aborted", { signal: AbortSignal.timeout(20) }, () => new Promise((resolve) => setTimeout(resolve, 2000)));
 `,
 	);
 	writeFileSync(
@@ -369,6 +370,7 @@ test("killed", () => { process.kill(process.pid, "SIGKILL"); });
 			"c.test.mjs::skipped": "skipped",
 			"c.test.mjs::todo": "todo",
 			"c.test.mjs::hangs": "failed, abnormal",
+			"c.test.mjs::aborted": "failed, abnormal",
 			"killed.test.mjs::killed.test.mjs": "failed, abnormal",
 		},
 	);
@@ -380,7 +382,12 @@ test("the reporter rebuilds suite paths from start events", async () => {
 		yield { type: "test:start", data: { name: "a", nesting: 1 } };
 		yield {
 			type: "test:fail",
-			data: { name: "a", nesting: 1, file: "/f", details: { type: "test" } },
+			data: {
+				name: "a",
+				nesting: 1,
+				file: "/f",
+				details: { type: "test", error: { failureType: "testCodeFailure" } },
+			},
 		};
 		yield {
 			type: "test:pass",
@@ -397,7 +404,16 @@ test("the reporter rebuilds suite paths from start events", async () => {
 		};
 		yield {
 			type: "test:fail",
-			data: { name: "f", nesting: 0, details: { error: { exitCode: 3 } } },
+			data: {
+				name: "f",
+				nesting: 0,
+				details: { error: { failureType: "testCodeFailure", exitCode: 3 } },
+			},
+		};
+		// An abort crossing process isolation arrives as a bare Error.
+		yield {
+			type: "test:fail",
+			data: { name: "bare", nesting: 0, details: { error: {} } },
 		};
 	}
 	const lines = [];
@@ -440,7 +456,14 @@ test("the reporter rebuilds suite paths from start events", async () => {
 				status: "failed",
 				abnormal: true,
 			},
-			{ end: true, count: 5 },
+			{
+				path: ["bare"],
+				file: null,
+				type: "test",
+				status: "failed",
+				abnormal: true,
+			},
+			{ end: true, count: 6 },
 		],
 	);
 });
@@ -462,4 +485,8 @@ test("a report is read only from one regular, singly linked, bounded file", () =
 	strictEqual(readReportFile(plain, 3), null);
 	mkdirSync(join(dir, "dir.xml"));
 	strictEqual(readReportFile(join(dir, "dir.xml")), null);
+	// A FIFO with no writer would block a plain open forever.
+	const fifo = join(dir, "fifo.xml");
+	strictEqual(spawnSync("/usr/bin/mkfifo", [fifo]).status, 0);
+	strictEqual(readReportFile(fifo), null);
 });

@@ -26,7 +26,8 @@ function invalid(detail) {
 /**
  * The report's text, or null when it is absent, not one regular file with a
  * single link (a planted symlink or hard link is never followed), or larger
- * than `maxBytes`.
+ * than `maxBytes`. It opens without blocking, so a FIFO planted in place of
+ * the report cannot hang the host.
  *
  * @param {string} path
  * @param {number} [maxBytes]
@@ -35,7 +36,10 @@ function invalid(detail) {
 export function readReportFile(path, maxBytes = MAX_REPORT_BYTES) {
 	let fd;
 	try {
-		fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+		fd = openSync(
+			path,
+			constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+		);
 	} catch {
 		return null;
 	}
@@ -310,8 +314,10 @@ export function parseNodeTestReport(text, checkoutRoots) {
  * with the same `test:start` nesting logic as node's own junit reporter, but
  * keeps every node's own result: junit turns a parent test into a
  * `<testsuite>` and drops a failure thrown by the parent itself. A failure is
- * `abnormal` when the test timed out, or its file's process was killed by a
- * signal or exited with a code other than 0 or 1.
+ * `abnormal` unless node classified it as an ordinary test, hook, subtest or
+ * cancelled-by-parent failure from a process that was not killed by a signal
+ * and exited 0 or 1: a timeout, an abort (whose type is lost across process
+ * isolation), or an unknown shape is abnormal.
  *
  * It is loaded from a `data:` URL as a standalone module, so it must not
  * reference anything outside its own body.
@@ -321,6 +327,12 @@ export function parseNodeTestReport(text, checkoutRoots) {
 export async function* nodeTestJsonReporter(source) {
 	const stack = [];
 	let count = 0;
+	const ordinaryFailures = new Set([
+		"testCodeFailure",
+		"subtestsFailed",
+		"hookFailure",
+		"cancelledByParent",
+	]);
 	const start = (name, nesting) => stack.push({ name, nesting });
 	for await (const event of source) {
 		const data = event?.data ?? {};
@@ -337,7 +349,7 @@ export async function* nodeTestJsonReporter(source) {
 			const exitCode = error?.exitCode;
 			const abnormal =
 				event.type === "test:fail" &&
-				(error?.failureType === "testTimeoutFailure" ||
+				(!ordinaryFailures.has(error?.failureType) ||
 					typeof error?.signal === "string" ||
 					(Number.isInteger(exitCode) && exitCode !== 0 && exitCode !== 1));
 			const status = marked(data.todo)
