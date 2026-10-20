@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
 	writeFileSync,
@@ -25,6 +26,29 @@ function runFixtureGit(projectPath, args) {
 afterEach(() => {
 	rmSync(TEST_DIR, { recursive: true, force: true });
 });
+/**
+ * A failed receipt plus the tail of every npm debug log under `root`: setup
+ * logs to `root` itself and the sandboxed check to `root/.npm/_logs`. npm
+ * exits with a system error's errno, so a bare exit code such as 255 (EPERM)
+ * cannot name the failing operation; the log can, and `afterEach` deletes it.
+ */
+function receiptEvidence(receipt, root) {
+	const logs = [];
+	for (const dir of [root, join(root, ".npm", "_logs")]) {
+		let names;
+		try {
+			names = readdirSync(dir);
+		} catch {
+			continue;
+		}
+		for (const name of names.filter((entry) => entry.endsWith(".log")).sort())
+			logs.push(
+				`--- ${name}`,
+				...readFileSync(join(dir, name), "utf8").split("\n").slice(-40),
+			);
+	}
+	return [JSON.stringify(receipt), ...logs].join("\n");
+}
 describe("Task 51 quick-check regression", {
 	skip: nestedSandboxSkip,
 }, () => {
@@ -170,7 +194,11 @@ child.unref();
 			allowedPaths: ["a.mjs"],
 			ownedRoot: root,
 		});
-		strictEqual(receipt.status, "passed", JSON.stringify(receipt));
+		strictEqual(
+			receipt.status,
+			"passed",
+			receipt.status === "passed" ? undefined : receiptEvidence(receipt, root),
+		);
 		strictEqual(receipt.setup.exitCode, 0);
 		strictEqual(receipt.checks[0].exitCode, 0);
 		strictEqual(readFileSync(join(root, "local-bin-ran"), "utf8"), "yes");
