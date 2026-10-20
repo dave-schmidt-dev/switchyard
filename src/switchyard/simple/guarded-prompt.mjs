@@ -32,6 +32,7 @@ function carriedNote(files) {
  * @param {string[]} [options.readOnlyInputs] Read-only input paths the provider must not modify.
  * @param {string[]} [options.checks] Acceptance check commands that run after the provider finishes.
  * @param {string[]} [options.redAtBaselineChecks] Exact commands of the acceptance checks that already failed on the unmodified checkout (the pre-provider dry run); named in a closing paragraph so the provider does not chase failures that predate the task. Adds nothing when empty or when no checks are declared.
+ * @param {string[]} [options.differentialChecks] Those red checks that pass test by test (differential acceptance): named in their own paragraph that asks only for the task's own tests to pass and no new failure; the rest keep the strict paragraph.
  * @param {string[]} [options.carriedFiles] Declared files already holding unfinished work carried from an earlier attempt (Task 3.11).
  * @param {boolean} [options.reportMode] Whether the run accepts exactly one report output.
  * @returns {string} The guarded prompt.
@@ -42,6 +43,7 @@ export function buildGuardedPrompt({
 	readOnlyInputs = [],
 	checks = [],
 	redAtBaselineChecks = [],
+	differentialChecks = [],
 	carriedFiles = [],
 	reportMode = false,
 }) {
@@ -55,11 +57,20 @@ export function buildGuardedPrompt({
 		: "";
 	if (!checks.length) return `${scopeSentence}${carried}${reportSentence}`;
 	const checkLines = checks.map((command) => `- \`${command}\``).join("\n");
-	const redLines = redAtBaselineChecks
-		.map((command) => `- \`${command}\``)
-		.join("\n");
-	const redNote = redLines
-		? `\n\nThese acceptance checks already fail on the unmodified checkout, before your change:\n${redLines}\nMake the failures your task is responsible for pass. Do not weaken, skip, or delete unrelated tests to turn a check green; if a pre-existing failure is outside your task and your declared files, leave it and finish the task.`
+	const listed = (commands) =>
+		commands.map((command) => `- \`${command}\``).join("\n");
+	const differential = new Set(differentialChecks);
+	const strictLines = listed(
+		redAtBaselineChecks.filter((command) => !differential.has(command)),
+	);
+	const differentialLines = listed(
+		redAtBaselineChecks.filter((command) => differential.has(command)),
+	);
+	const redNote = strictLines
+		? `\n\nThese acceptance checks already fail on the unmodified checkout, before your change:\n${strictLines}\nMake the failures your task is responsible for pass. Do not weaken, skip, or delete unrelated tests to turn a check green; if a pre-existing failure is outside your task and your declared files, leave it and finish the task.`
 		: "";
-	return `${scopeSentence}${carried}${reportSentence}\n\nAfter you finish, these acceptance checks run against your candidate in an independent trusted checkout and must all pass. Write code that satisfies them, including formatting, import order, lint rules and types:\n${checkLines}${redNote}`;
+	const differentialNote = differentialLines
+		? `\n\nThese test-runner checks already fail on the unmodified checkout and are judged test by test:\n${differentialLines}\nThe task's own tests (every test you add, and every test in your declared files) must pass, and no new failure may appear: a test that passed before must still pass, and none may be removed or skipped. Failures that predate the task outside your declared files may remain. Do not weaken, skip, or delete unrelated tests.`
+		: "";
+	return `${scopeSentence}${carried}${reportSentence}\n\nAfter you finish, these acceptance checks run against your candidate in an independent trusted checkout and must all pass. Write code that satisfies them, including formatting, import order, lint rules and types:\n${checkLines}${redNote}${differentialNote}`;
 }

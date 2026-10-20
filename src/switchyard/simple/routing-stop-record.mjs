@@ -167,6 +167,8 @@ function causeFields(result, accountability = result?.accountability) {
 		diffRejectionRule: details?.diffRejectionRule ?? undefined,
 		diffRejectionUnknownStep: details?.diffRejectionUnknownStep ?? undefined,
 		diffRejectionUnknownCause: details?.diffRejectionUnknownCause ?? undefined,
+		checkAcceptance: result?.checkAcceptance ?? undefined,
+		toleratedBaselineFailures: result?.toleratedBaselineFailures ?? undefined,
 	};
 }
 

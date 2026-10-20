@@ -72,6 +72,41 @@ test("red-at-baseline checks append one paragraph naming the commands in order",
 	strictEqual(prompt, `${base}\n\n${RED_PARAGRAPH}`);
 });
 
+const DIFFERENTIAL_PARAGRAPH =
+	"These test-runner checks already fail on the unmodified checkout and are judged test by test:\n- `node --test`\nThe task's own tests (every test you add, and every test in your declared files) must pass, and no new failure may appear: a test that passed before must still pass, and none may be removed or skipped. Failures that predate the task outside your declared files may remain. Do not weaken, skip, or delete unrelated tests.";
+
+test("a red check that passes test by test gets the differential paragraph; the rest stay strict", () => {
+	const checks = ["ruff check .", "node --test", "swiftlint --strict"];
+	const base = buildGuardedPrompt({ ...BASE_OPTIONS, checks });
+	const prompt = buildGuardedPrompt({
+		...BASE_OPTIONS,
+		checks,
+		redAtBaselineChecks: ["ruff check .", "node --test", "swiftlint --strict"],
+		differentialChecks: ["node --test"],
+	});
+	strictEqual(
+		prompt,
+		`${base}\n\n${RED_PARAGRAPH}\n\n${DIFFERENTIAL_PARAGRAPH}`,
+	);
+	// Only the differential check: no strict paragraph at all.
+	const only = buildGuardedPrompt({
+		...BASE_OPTIONS,
+		checks,
+		redAtBaselineChecks: ["node --test"],
+		differentialChecks: ["node --test"],
+	});
+	strictEqual(only, `${base}\n\n${DIFFERENTIAL_PARAGRAPH}`);
+	// A qualifying name that is not red at baseline adds nothing.
+	strictEqual(
+		buildGuardedPrompt({
+			...BASE_OPTIONS,
+			checks,
+			differentialChecks: ["node --test"],
+		}),
+		base,
+	);
+});
+
 test("red-at-baseline names without declared checks add nothing", () => {
 	strictEqual(
 		buildGuardedPrompt({

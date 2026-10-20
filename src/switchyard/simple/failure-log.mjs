@@ -52,11 +52,15 @@ const OPTIONAL_FIELD_TYPES = Object.freeze({
 	usageError: "string",
 	lifecycleCheck: "string",
 	gitControlTamper: "gitControlTamper",
+	// How a failed attempt's checks had passed before a later failure.
+	checkAcceptance: "string",
+	toleratedBaselineFailures: "count",
 	...DETAIL_FIELD_TYPES,
 });
 // Closed enums: a supplied value outside its set is recorded as null.
 const CLOSED_OPTIONAL_VALUES = Object.freeze({
 	lifecycleCheck: LIFECYCLE_CHECKS,
+	checkAcceptance: ["strict", "differential"],
 	diffRejectionUnknownStep: INTEGRATION_UNKNOWN_STEPS,
 	diffRejectionUnknownCause: INTEGRATION_UNKNOWN_CAUSES,
 });
@@ -104,6 +108,9 @@ function sanitizeOptionalField(type, value) {
 		return sanitizeGitControlTamper(value) ?? undefined;
 	if (type === "boolean") return typeof value === "boolean" ? value : null;
 	if (type === "integer") return sanitizeIntegerField(value);
+	// An unbounded tally: any nonnegative safe integer, never capped at 4096.
+	if (type === "count")
+		return Number.isSafeInteger(value) && value >= 0 ? value : null;
 	if (type === "stringArray") return sanitizeStringArray(value);
 	return sanitizeString(value);
 }

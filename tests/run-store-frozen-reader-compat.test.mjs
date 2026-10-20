@@ -156,6 +156,33 @@ describe("run records stay readable by frozen releases", () => {
 		});
 	}
 
+	it("keeps a terminal summary's check-acceptance marker frozen-readable", async () => {
+		for (const [state, checkAcceptance, tolerated] of [
+			["succeeded", "differential", 2],
+			["succeeded", "strict", 0],
+			["failed", "differential", 3],
+		]) {
+			const opts = makeOptions({ orderedTaskIds: ["task-1"] });
+			await initializeRun(opts);
+			await updateRunWithRetry(opts.runId, {
+				state,
+				cleanupState: "pending",
+				finishedAt: new Date().toISOString(),
+				terminalSummary: {
+					status: state,
+					baseRevision: null,
+					changedFiles: [],
+					outputs: [],
+					checkAcceptance,
+					toleratedBaselineFailures: tolerated,
+				},
+			});
+			const disk = onDisk(opts.runId);
+			strictEqual(disk.terminalSummary.checkAcceptance, checkAcceptance);
+			assertFrozenReadersAccept(disk, `${state} ${checkAcceptance}`);
+		}
+	});
+
 	it("leaves every frozen cause code and its category unchanged", async () => {
 		for (const [causeCode, category] of CODE_CATEGORIES) {
 			if (projectedCodes.has(causeCode)) continue;

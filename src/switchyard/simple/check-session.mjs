@@ -127,13 +127,18 @@ export function createSimpleCheckSessions({
 	onProgress,
 	cachePath,
 	evidenceDir = null,
+	differentialBaselines = null,
 }) {
 	let active = null;
 	let lifecycle = "never_started";
 	let evidenceAttempt = 1;
 	let evidenceIndex = 0;
-	// Baselines captured on the base tree (attempt 0) judge later candidates.
-	const differential = createDifferentialChecks({ declaredFiles: files ?? [] });
+	// Baselines captured on the base tree (attempt 0), or seeded from the
+	// original session on a HEAD-advance recheck, judge later candidates.
+	const differential = createDifferentialChecks({
+		declaredFiles: files ?? [],
+		baselines: differentialBaselines,
+	});
 	function timeout() {
 		if (signal?.aborted) throw refused("cancelled");
 		const remaining = deadlineMs - now();
@@ -593,6 +598,10 @@ export function createSimpleCheckSessions({
 		run,
 		format,
 		resolveCheckExecutables,
+		// Baselines from the original base tree, for a HEAD-advance recheck and
+		// for the prompt's wording of each red check.
+		differentialBaselines: differential.baselines,
+		differentialQualifies: differential.qualifies,
 		get path() {
 			return active?.path;
 		},

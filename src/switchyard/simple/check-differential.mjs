@@ -168,16 +168,62 @@ const environmentFailure = (result) =>
 	classifyFailedCheck(result, { preProvider: false }) !== null;
 
 /**
+ * How a result's checks were accepted, for the caller's terminal result: a
+ * finished set of passing checks is `strict` unless one passed only under the
+ * differential rule. `toleratedBaselineFailures` counts the pre-existing
+ * failures still failing in those accepted runs. Empty unless every one of
+ * the `expected` declared checks ran and passed.
+ *
+ * @param {object[]} checks The result's check entries.
+ * @param {number} expected How many checks the task declared.
+ * @returns {{checkAcceptance?: string, toleratedBaselineFailures?: number}}
+ */
+export function checkAcceptanceOf(checks, expected) {
+	if (!Array.isArray(checks) || checks.length === 0) return {};
+	if (checks.length !== expected) return {};
+	if (checks.some((check) => check?.status !== "passed")) return {};
+	const accepted = checks.filter(
+		(check) => check.differential?.verdict === "accepted",
+	);
+	return {
+		checkAcceptance: accepted.length > 0 ? "differential" : "strict",
+		toleratedBaselineFailures: accepted.reduce(
+			(total, check) => total + (check.differential.after?.failedCount ?? 0),
+			0,
+		),
+	};
+}
+
+/**
  * Per-session differential state: the baseline per check command, captured on
  * the base tree, and the judgement of each later candidate run.
  *
  * @param {object} options
  * @param {string[]} options.declaredFiles The task's declared repo-relative paths.
+ * @param {Map<string, object>} [options.baselines] Baselines another session
+ *   captured on the original base tree; a HEAD-advance recheck judges against
+ *   them.
  */
-export function createDifferentialChecks({ declaredFiles }) {
-	const baselines = new Map();
+export function createDifferentialChecks({ declaredFiles, baselines: seed }) {
+	const baselines = new Map(seed ? structuredClone(seed) : []);
 	let reports = 0;
 	return {
+		/**
+		 * A copy of every captured baseline, by check command. An entry with
+		 * `tests` qualifies its check for differential acceptance.
+		 */
+		baselines: () => structuredClone(baselines),
+		/**
+		 * Whether a red `command` can pass differentially: its baseline was read
+		 * cleanly, names at least one failing test, and none ended abnormally.
+		 */
+		qualifies(command) {
+			const tests = [...(baselines.get(command)?.tests?.values() ?? [])];
+			return (
+				tests.some(({ status }) => status === "failed") &&
+				!tests.some(({ abnormal }) => abnormal)
+			);
+		},
 		/**
 		 * How to run `command` now. Returns null to run it unchanged with no
 		 * differential judgement (not a test runner, or no red baseline), or a

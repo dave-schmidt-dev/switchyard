@@ -55,6 +55,7 @@ import {
 	prepareSimpleOverlayBaseline,
 	runSimpleBaselineChecks,
 } from "./baseline.mjs";
+import { checkAcceptanceOf } from "./check-differential.mjs";
 import { dryRunAcceptanceChecks, existsInCheckout } from "./check-dry-run.mjs";
 import {
 	CHECK_ENVIRONMENT_SIGNATURES,
@@ -133,7 +134,14 @@ export async function runSimpleTask(options, dependencies = {}) {
 	// a task id across attempts, while run-store records are create-only.
 	const runId = dependencies.runId ?? `simple-${taskId}-${randomUUID()}`;
 	const startedAt = now();
-	const base = { taskId, attemptId, runId, startedAt, now };
+	const base = {
+		taskId,
+		attemptId,
+		runId,
+		startedAt,
+		now,
+		checkCount: options.checks?.length ?? 0,
+	};
 	const onStatus = dependencies.onStatus;
 	const signal = dependencies.signal;
 	const reportMode = options.reportMode === true;
@@ -723,6 +731,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 								error?.deadlineFit ?? selectedSizing,
 								{ persisted: true },
 							),
+							...checkAcceptanceOf(checks, base.checkCount),
 						},
 						finishedAt: new Date(now()).toISOString(),
 						lastFailure: sanitizeFailureMetadata({
@@ -1424,12 +1433,20 @@ export async function runSimpleTask(options, dependencies = {}) {
 			worktreeGitControl = snapshotGitControl(worktreePath);
 		if (continuation) dependencies.onContinuation?.(continuation);
 		const redAtBaseline = dryRun?.redAtBaseline ?? [];
+		// Red checks whose base-tree tests were read cleanly pass test by test.
+		const differentialAtBaseline = redAtBaseline.filter(
+			(i) =>
+				checkSessions?.differentialQualifies(options.checks[i - 1]) === true,
+		);
 		const guardedPrompt = buildGuardedPrompt({
 			promptText: readFileSync(options.promptPath, "utf8"),
 			files: options.files,
 			readOnlyInputs: options.readOnlyInputs ?? [],
 			checks: options.checks ?? [],
 			redAtBaselineChecks: redAtBaseline.map((i) => options.checks[i - 1]),
+			differentialChecks: differentialAtBaseline.map(
+				(i) => options.checks[i - 1],
+			),
 			carriedFiles: continuation?.carried ? continuation.files : [],
 			reportMode,
 		});
@@ -2129,6 +2146,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 							? "acceptance_check_timeout"
 							: "acceptance_check_failed",
 					redAtBaseline: redAtBaseline.includes(index + 1),
+					differential: differentialAtBaseline.includes(index + 1),
 				});
 				const repairPrepared = await healthController.prepare({
 					provider,
@@ -2468,6 +2486,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 						deadlineMs: options.deadlineMs,
 						cachePath: dependencies.checkCachePath,
 						evidenceDir: join(getRunRoot(runId), "check-evidence"),
+						// A differentially accepted check is judged against the
+						// original base's failing set, never the advanced HEAD's.
+						differentialBaselines: checkSessions.differentialBaselines(),
 						now,
 						signal,
 						onProgress: () =>
@@ -2506,6 +2527,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 					if (!recheck?.success) {
 						keepWorktree = true;
 						return fail("host_concurrency", "integrate");
+					}
+					// The integrated candidate is the one rechecked here, so its
+					// verdict replaces the earlier one in the result.
+					if (headAdvanceSession && checks[index]) {
+						delete checks[index].differential;
+						if (recheck.differential)
+							checks[index].differential = recheck.differential;
 					}
 				}
 			} catch (error) {
@@ -2687,6 +2715,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 						changedFiles,
 						outputs: terminalOutputs,
 						...heldTerminal,
+						...checkAcceptanceOf(checks, base.checkCount),
 						...undeclaredSummary,
 						...(terminalProviderReliability
 							? { providerReliability: terminalProviderReliability }
@@ -2820,6 +2849,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 						changedFiles,
 						outputs: terminalOutputs,
 						...heldTerminal,
+						...checkAcceptanceOf(checks, base.checkCount),
 						...undeclaredSummary,
 						...(terminalProviderReliability
 							? { providerReliability: terminalProviderReliability }

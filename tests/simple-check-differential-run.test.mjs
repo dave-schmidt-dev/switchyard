@@ -2,9 +2,10 @@
 // Differential acceptance through runSimpleTask with the real sandboxed check
 // session: the TASKS "red before the change" done-when fixtures.
 import { ok, strictEqual } from "node:assert";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
+import { readRun } from "../src/switchyard/run-store/index.mjs";
 import { classifyAttemptFailure } from "../src/switchyard/simple/failure-severity.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
 import { git } from "./helpers/check-dry-run-repo.mjs";
@@ -113,16 +114,33 @@ test("a check that should pass but is red at baseline stops before provider laun
 	strictEqual(result.failureReason, "baseline_check_failed");
 });
 
+const DIFFERENTIAL_NOTE = `judged test by test:\n- \`${CHECK}\``;
+const STRICT_NOTE =
+	"These acceptance checks already fail on the unmodified checkout, before your change:";
+
 test("pre-existing unrelated failures pass differentially once the targeted test passes", {
 	skip: !sandboxed,
 }, async () => {
+	let prompt = null;
 	const { result, providerCalls } = await runTask(
 		projectFixture(),
 		{},
-		implementsFeature,
+		async (context) => {
+			prompt = context.prompt;
+			return implementsFeature(context);
+		},
 	);
 	strictEqual(providerCalls, 1);
 	strictEqual(result.status, "succeeded", JSON.stringify(result.checks));
+	// The provider heard the differential rule, not the strict one.
+	ok(prompt.includes(DIFFERENTIAL_NOTE), prompt);
+	ok(!prompt.includes(STRICT_NOTE), prompt);
+	// The caller sees how the checks passed without opening run.json.
+	strictEqual(result.checkAcceptance, "differential");
+	strictEqual(result.toleratedBaselineFailures, 2);
+	const { terminalSummary } = await readRun(result.runId);
+	strictEqual(terminalSummary.checkAcceptance, "differential");
+	strictEqual(terminalSummary.toleratedBaselineFailures, 2);
 	const [check] = result.checks;
 	strictEqual(check.status, "passed");
 	const { differential } = check;
@@ -138,6 +156,78 @@ test("pre-existing unrelated failures pass differentially once the targeted test
 		differential.baseline.failed.includes("tests/legacy.test.mjs::host clock"),
 	);
 	ok(existsSync(differential.evidencePath), "the nonzero run kept evidence");
+});
+
+test("a differentially accepted check still passes after an unrelated peer commit advances HEAD", {
+	skip: !sandboxed,
+}, async () => {
+	const repo = projectFixture();
+	const { result, providerCalls } = await runTask(repo, {}, async (context) => {
+		await implementsFeature(context);
+		writeFileSync(join(repo.projectPath, "NOTES.txt"), "peer note\n");
+		git(repo.projectPath, ["add", "NOTES.txt"]);
+		git(repo.projectPath, [
+			"-c",
+			"user.name=Peer",
+			"-c",
+			"user.email=peer@example.invalid",
+			"commit",
+			"-qm",
+			"peer unrelated",
+		]);
+		return { success: true, writerLifecycle: "stopped" };
+	});
+	strictEqual(providerCalls, 1);
+	// The recheck at the advanced HEAD judges against the original base's
+	// failing set; without it the red check would end host_concurrency.
+	strictEqual(result.status, "succeeded", JSON.stringify(result));
+	strictEqual(result.checks[0].differential.verdict, "accepted");
+	strictEqual(result.checkAcceptance, "differential");
+	strictEqual(
+		readFileSync(join(repo.projectPath, "src", "feature.mjs"), "utf8"),
+		"export const feature = () => 42;\n",
+	);
+	strictEqual(
+		readFileSync(join(repo.projectPath, "NOTES.txt"), "utf8"),
+		"peer note\n",
+	);
+});
+
+test("a recheck that passes strictly at the advanced HEAD replaces the differential verdict", {
+	skip: !sandboxed,
+}, async () => {
+	const repo = projectFixture();
+	const { result } = await runTask(repo, {}, async (context) => {
+		await implementsFeature(context);
+		// An unrelated peer commit fixes every pre-existing failure.
+		writeFileSync(
+			join(repo.projectPath, "tests", "legacy.test.mjs"),
+			LEGACY.replace("strictEqual(1, 2)", "strictEqual(1, 1)").replace(
+				'strictEqual("a", "b")',
+				'strictEqual("a", "a")',
+			),
+		);
+		git(repo.projectPath, ["add", "tests/legacy.test.mjs"]);
+		git(repo.projectPath, [
+			"-c",
+			"user.name=Peer",
+			"-c",
+			"user.email=peer@example.invalid",
+			"commit",
+			"-qm",
+			"peer fixes legacy",
+		]);
+		return { success: true, writerLifecycle: "stopped" };
+	});
+	strictEqual(result.status, "succeeded", JSON.stringify(result));
+	strictEqual(result.checks[0].status, "passed");
+	strictEqual(result.checks[0].differential, undefined);
+	strictEqual(result.checkAcceptance, "strict");
+	strictEqual(result.toleratedBaselineFailures, 0);
+	strictEqual(
+		(await readRun(result.runId)).terminalSummary.checkAcceptance,
+		"strict",
+	);
 });
 
 test("a candidate that adds a new failure is refused", {
@@ -168,6 +258,11 @@ test("a candidate that adds a new failure is refused", {
 	strictEqual(check.status, "failed");
 	strictEqual(check.differential.verdict, "refused");
 	strictEqual(check.differential.reason, "new_failure");
+	strictEqual(result.checkAcceptance, undefined);
+	strictEqual(
+		(await readRun(result.runId)).terminalSummary.checkAcceptance,
+		undefined,
+	);
 	strictEqual(
 		check.differential.after.newFailures[0],
 		"tests/legacy.test.mjs::still green",
@@ -187,10 +282,23 @@ test("an intentional red check stays strict and still waterfalls", {
 }, async () => {
 	const repo = projectFixture();
 	const grep = "grep -q 42 src/feature.mjs";
-	const passed = await runTask(repo, { checks: [grep] }, implementsFeature);
+	let prompt = null;
+	const passed = await runTask(repo, { checks: [grep] }, async (context) => {
+		prompt = context.prompt;
+		return implementsFeature(context);
+	});
 	strictEqual(passed.result.status, "succeeded");
 	strictEqual(passed.result.checks[0].status, "passed");
 	strictEqual(passed.result.checks[0].differential, undefined);
+	strictEqual(passed.result.checkAcceptance, "strict");
+	strictEqual(passed.result.toleratedBaselineFailures, 0);
+	strictEqual(
+		(await readRun(passed.result.runId)).terminalSummary.checkAcceptance,
+		"strict",
+	);
+	// A red check that is not a test runner keeps the strict wording.
+	ok(prompt.includes(`${STRICT_NOTE}\n- \`${grep}\``), prompt);
+	ok(!prompt.includes("judged test by test"), prompt);
 
 	const missed = await runTask(
 		projectFixture(),

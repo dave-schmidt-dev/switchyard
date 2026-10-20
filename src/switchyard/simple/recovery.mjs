@@ -3,6 +3,7 @@ import { realpathSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { parsePredecessorReceipt } from "../lifecycle/overlay-receipts.mjs";
 import { readRun } from "../run-store/run-records.mjs";
+import { checkAcceptanceOf } from "./check-differential.mjs";
 import { safeChangedFiles } from "./provider-invocation.mjs";
 
 const SIMPLE_RECOVERY_SCHEMA_VERSION = 1;
@@ -224,6 +225,9 @@ function terminalResult(base, overrides = {}) {
 		outputs: overrides.outputs ?? [],
 		baseRevision: overrides.baseRevision ?? null,
 		checks: overrides.checks ?? [],
+		// Whether the checks passed strictly or under the differential rule,
+		// without opening run.json or each check's record.
+		...checkAcceptanceOf(overrides.checks, base.checkCount),
 		failureReason: overrides.failureReason ?? null,
 		failurePhase: overrides.failurePhase ?? null,
 		errorKind:
