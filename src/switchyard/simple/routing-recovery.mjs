@@ -181,7 +181,8 @@ export function writerQuiescent(record, deps = {}) {
  * over -- a terminal run record, a quiescent writer, no live project lock and
  * no retained-unclaimed worktree still on disk -- and records the attempt as
  * terminal `skipped` with reason `lifecycle_recovered`. The whole check and
- * transition run under the routing-run lock.
+ * transition run under the routing-run lock. The task is named by its
+ * persisted identity hash or by the `--task-id` given to `simple`.
  */
 export async function closePendingAttempt(options, deps = {}) {
 	const projectPath = canonicalRoutingProject(options.projectPath);
@@ -193,7 +194,10 @@ export async function closePendingAttempt(options, deps = {}) {
 	try {
 		const pending = handle.state.pendingAttempt;
 		if (!pending) rejectRelease("pending_attempt_missing");
-		if (options.taskId !== undefined && pending.taskId !== options.taskId)
+		if (
+			options.taskId !== undefined &&
+			!taskIdCandidates(projectPath, options.taskId).includes(pending.taskId)
+		)
 			rejectRelease("routing_pending_identity_mismatch");
 		const record = await (deps.readRun ?? readRun)(pending.runId).catch(
 			() => null,

@@ -42,7 +42,7 @@ const ROUTING_RUN_USAGE = `Usage: switchyard-dispatch routing-run inspect --proj
        switchyard-dispatch routing-run close-pending --project <path> --routing-run-id <id> --task-id <id>
        switchyard-dispatch routing-run native-start --project <path> --routing-run-id <id> --authorization <manifest> --actual-start <receipt> --task-id <id> --invocation-id <id>
        switchyard-dispatch routing-run failures [--since <RFC3339>] [--json]
-release-partial --task-id takes the --task-id given to simple or the persisted task hash.
+release-partial and close-pending --task-id take the --task-id given to simple or the persisted task hash.
 Native acknowledgement requires existing idle state, exact task authorization and an actual-start receipt. The latch gives direction only; future task authority remains caller-owned.`;
 const RFC3339 =
 	/^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$/u;

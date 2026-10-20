@@ -1,5 +1,10 @@
 // @test-phase: other
-import { deepStrictEqual, rejects, strictEqual } from "node:assert";
+import {
+	deepStrictEqual,
+	notStrictEqual,
+	rejects,
+	strictEqual,
+} from "node:assert";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -10,6 +15,7 @@ import {
 	openRoutingRun,
 	readRoutingRunState,
 } from "../src/switchyard/simple/routing-state.mjs";
+import { routingTaskIdentityHash } from "../src/switchyard/simple/routing-task-identity.mjs";
 import { simpleQuarantinePath } from "../src/switchyard/simple/worktree-cleanup.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
@@ -22,10 +28,18 @@ afterEach(() => {
 
 // A pending attempt left dangling by an unconfirmed lifecycle: the run
 // record is the durable evidence close-pending must prove before closing it.
-function fixture({ record: overrides } = {}) {
+// callerTaskId: the --task-id a caller passed to simple. Routing state then
+// persists the identity hash simple bound for it, never the caller's value.
+function fixture({
+	record: overrides,
+	callerTaskId = null,
+	origin = "work",
+} = {}) {
 	const project = realpathSync(tempDir("pending-recovery-project-"));
 	const stateRoot = realpathSync(tempDir("pending-recovery-state-"));
-	const taskId = "task-1";
+	const taskId = callerTaskId
+		? routingTaskIdentityHash({ taskId: callerTaskId }, project, origin)
+		: "task-1";
 	const pending = {
 		attemptId: "attempt-1",
 		taskId,
@@ -59,7 +73,7 @@ function fixture({ record: overrides } = {}) {
 			"--routing-run-id",
 			"run-1",
 			"--task-id",
-			taskId,
+			callerTaskId ?? taskId,
 		],
 		deps: {
 			stateRoot,
@@ -329,6 +343,51 @@ test("a task-id mismatch and a missing pending attempt are refused", async () =>
 		code: "pending_attempt_missing",
 	});
 	strictEqual(readState(f).pendingAttempt, null);
+});
+
+for (const origin of ["work", "qualification"]) {
+	test(`close-pending accepts the --task-id given to simple (${origin} origin)`, async () => {
+		const f = fixture({ callerTaskId: "caller-task.1", origin });
+		strictEqual(f.argv.at(-1), "caller-task.1");
+		notStrictEqual(f.pending.taskId, "caller-task.1");
+		let output;
+		await handleRoutingRun(f.argv, {
+			...f.deps,
+			writeResult: (value) => {
+				output = JSON.parse(value);
+			},
+		});
+		strictEqual(output.ok, true);
+		strictEqual(output.taskId, f.pending.taskId);
+		const state = readState(f);
+		strictEqual(state.pendingAttempt, null);
+		strictEqual(state.attempts[0].reason, "lifecycle_recovered");
+	});
+}
+
+test("close-pending still accepts the persisted task hash", async () => {
+	const f = fixture({ callerTaskId: "caller-task.1" });
+	let output;
+	await handleRoutingRun([...f.argv.slice(0, -1), f.pending.taskId], {
+		...f.deps,
+		writeResult: (value) => {
+			output = JSON.parse(value);
+		},
+	});
+	strictEqual(output.ok, true);
+	strictEqual(output.taskId, f.pending.taskId);
+	strictEqual(readState(f).pendingAttempt, null);
+});
+
+test("a caller task id bound to another task or not a caller id is refused", async () => {
+	const f = fixture({ callerTaskId: "caller-task.1" });
+	const before = readState(f);
+	for (const taskId of ["other-caller-task", "bad id with spaces"]) {
+		await rejects(handleRoutingRun([...f.argv.slice(0, -1), taskId], f.deps), {
+			code: "routing_pending_identity_mismatch",
+		});
+	}
+	deepStrictEqual(readState(f), before);
 });
 
 test("close-pending requires --task-id and rejects foreign options", async () => {
