@@ -30,28 +30,35 @@ export const PROVIDER_SIGNATURES = Object.freeze([
 	"unrecognized",
 ]);
 
-// The keyless bridge (ops/simple-provider-keyless-bridge.mjs) exits 76 with
-// this fixed last line whenever its provider stopped before a verified
-// completion. Every field is a trusted status token, and the bridge frames any
-// child line that starts with its prefix, so the line cannot be forged.
-const KEYLESS_BRIDGE_FAILURE_EXIT = 76;
-const KEYLESS_BRIDGE_TERMINATION =
-	/^simple-provider-keyless-bridge: provider terminated before a verified completion \(code (?:none|\d{1,10}), signal ([A-Z][A-Z0-9_]{0,31}|none|unknown), error (?:[A-Z][A-Z0-9_]{0,31}|none|unknown), interrupt (duration-limit|SIGTERM|SIGINT|none)\)$/u;
+// The keyless bridge (ops/simple-provider-keyless-bridge.mjs) and the native
+// launchers (ops/simple-native-launcher-core.mjs, wrapped by each launcher's
+// "failed closed" line) exit 76 with this fixed last line whenever their
+// provider stopped before a verified completion. Every field is a trusted
+// status token, and each frames any child line that starts with its own
+// prefix, so the line cannot be forged.
+const TERMINATION_FAILURE_EXIT = 76;
+const TERMINATION_FIELDS = String.raw`provider terminated before a verified completion \(code (?:none|\d{1,10}), signal (?<signal>[A-Z][A-Z0-9_]{0,31}|none|unknown), error (?:[A-Z][A-Z0-9_]{0,31}|none|unknown), interrupt (?<interrupt>duration-limit|SIGTERM|SIGINT|none)\)`;
+const KEYLESS_BRIDGE_TERMINATION = new RegExp(
+	`^simple-provider-keyless-bridge: ${TERMINATION_FIELDS}$`,
+	"u",
+);
+const NATIVE_LAUNCHER_TERMINATION = new RegExp(
+	String.raw`^(?<launcher>simple-(?:claude|vibe)-code-launcher): failed closed \(\k<launcher>: ${TERMINATION_FIELDS}\)$`,
+	"u",
+);
 
 /**
- * Closed signature for a keyless bridge exit whose provider was stopped by a
- * signal or an interrupt, or null for any other output. A deadline drove the
- * kill only when the bridge's own duration limit fired or the runner timed the
- * attempt out; every other signal or interrupt is a plain kill. A spawn error
- * with neither field set is not a kill.
+ * Closed signature for a bridge or native launcher exit whose provider was
+ * stopped by a signal or an interrupt, or null for any other output. A
+ * deadline drove the kill only when the process's own duration limit fired or
+ * the runner timed the attempt out; every other signal or interrupt is a plain
+ * kill. A spawn error with neither field set is not a kill.
  */
-function keylessBridgeSignature(text, exitCode, timedOut) {
-	if (exitCode !== KEYLESS_BRIDGE_FAILURE_EXIT) return null;
-	const match = KEYLESS_BRIDGE_TERMINATION.exec(
-		text.trimEnd().split(/\r?\n/u).at(-1),
-	);
+function terminationSignature(text, exitCode, timedOut, pattern) {
+	if (exitCode !== TERMINATION_FAILURE_EXIT) return null;
+	const match = pattern.exec(text.trimEnd().split(/\r?\n/u).at(-1));
 	if (!match) return null;
-	const [, signal, interrupt] = match;
+	const { signal, interrupt } = match.groups;
 	if (signal === "none" && interrupt === "none") return null;
 	return interrupt === "duration-limit" || timedOut === true
 		? "provider_deadline_exceeded"
@@ -210,6 +217,9 @@ export function createRateLimitMatcher({ prompt = "" } = {}) {
  * @param {string|null} [input.signal]
  * @param {boolean} [input.keylessBridge] the process is the keyless bridge,
  *   so an otherwise unrecognized exit may carry its termination line
+ * @param {boolean} [input.nativeLauncher] the process is a native Claude Code
+ *   or Vibe Code launcher, so an otherwise unrecognized exit may carry its
+ *   wrapped termination line
  * @param {boolean} [input.timedOut] the runner's deadline stopped the process
  * @returns {{ providerSignature: string, stderrBytes: number, stdoutBytes: number }}
  */
@@ -219,6 +229,7 @@ export function classifyProviderOutput({
 	exitCode = null,
 	signal = null,
 	keylessBridge = false,
+	nativeLauncher = false,
 	timedOut = false,
 } = {}) {
 	const errText =
@@ -274,9 +285,16 @@ export function classifyProviderOutput({
 		exitCode === 504
 	) {
 		providerSignature = "network_error";
-	} else if (keylessBridge) {
+	} else if (keylessBridge || nativeLauncher) {
 		providerSignature =
-			keylessBridgeSignature(errText, exitCode, timedOut) ?? "unrecognized";
+			terminationSignature(
+				errText,
+				exitCode,
+				timedOut,
+				keylessBridge
+					? KEYLESS_BRIDGE_TERMINATION
+					: NATIVE_LAUNCHER_TERMINATION,
+			) ?? "unrecognized";
 	}
 
 	return Object.freeze({

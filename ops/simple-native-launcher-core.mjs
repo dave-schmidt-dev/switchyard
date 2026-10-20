@@ -30,6 +30,19 @@ export const UNSAFE_CONTROL_PATTERN = new RegExp(
 	"gu",
 );
 
+/** A status field printed as-is only when it is an upper-case token. */
+function statusToken(value) {
+	if (value === undefined || value === null) return "none";
+	return /^[A-Z][A-Z0-9_]{0,31}$/u.test(String(value))
+		? String(value)
+		: "unknown";
+}
+
+// Lines a launcher writes itself start with its `simple-<name>-launcher:`
+// label, so a child line that looks like one is marked as the child's.
+const RESERVED_LINE_PATTERN =
+	/(^|[\n\r\u2028\u2029])([^\S\n\r\u2028\u2029]*simple-[a-z-]*launcher:)/gu;
+
 /**
  * Strips ANSI terminal escape sequences and unsafe control bytes from output.
  * @param {Buffer | string} bytes
@@ -330,7 +343,7 @@ export async function runSandboxedNative({
 		fail("prompt is empty or too large");
 
 	let child;
-	let interrupted = false;
+	let interrupted = null;
 	try {
 		child = spawn(sandboxExec, ["-p", profile, cliPath, ...args], {
 			cwd: worktree,
@@ -368,14 +381,16 @@ export async function runSandboxedNative({
 				process.stderr.write(`switchyard: ${heartbeatLabel} still running\n`),
 			15_000,
 		);
-		const stop = () => {
-			interrupted = true;
+		const stop = (reason) => {
+			interrupted ??= reason;
 			killGroup(child, "SIGTERM");
 			setTimeout(() => killGroup(child, "SIGKILL"), 1_000).unref();
 		};
-		const timer = setTimeout(stop, timeoutMs);
-		process.once("SIGTERM", stop);
-		process.once("SIGINT", stop);
+		const timer = setTimeout(() => stop("duration-limit"), timeoutMs);
+		const onTerm = () => stop("SIGTERM");
+		const onInt = () => stop("SIGINT");
+		process.once("SIGTERM", onTerm);
+		process.once("SIGINT", onInt);
 		let status;
 		try {
 			status = await new Promise((done) => {
@@ -385,25 +400,31 @@ export async function runSandboxedNative({
 		} finally {
 			clearInterval(heartbeat);
 			clearTimeout(timer);
-			process.removeListener("SIGTERM", stop);
-			process.removeListener("SIGINT", stop);
+			process.removeListener("SIGTERM", onTerm);
+			process.removeListener("SIGINT", onInt);
 		}
 		if (stdinError)
 			fail(`prompt pipe failed (${stdinError.code ?? "unknown"})`);
+		// provider-signature.mjs types this fixed line (with the launcher's
+		// "failed closed" wrapper) as provider_killed or
+		// provider_deadline_exceeded; keep the two in step.
 		if (
-			interrupted ||
+			interrupted !== null ||
 			status.error ||
 			status.signal ||
 			outputSize > MAX_OUTPUT ||
 			errorSize > MAX_OUTPUT
 		)
 			fail(
-				`provider terminated before a verified completion (code ${status.code ?? "none"}, signal ${status.signal ?? "none"}, error ${status.error?.code ?? "none"})`,
+				`provider terminated before a verified completion (code ${Number.isSafeInteger(status.code) ? status.code : "none"}, signal ${statusToken(status.signal)}, error ${statusToken(status.error?.code)}, interrupt ${interrupted ?? "none"})`,
 			);
 		const result = {
 			code: status.code,
 			stdout: boundedText(Buffer.concat(output)),
-			stderr: boundedText(Buffer.concat(errors)),
+			stderr: boundedText(Buffer.concat(errors)).replace(
+				RESERVED_LINE_PATTERN,
+				"$1child: $2",
+			),
 		};
 		if (status.code !== 0) return { ...result, code: status.code || 76 };
 		if (verify) await verify(result);

@@ -37,6 +37,10 @@ const CLAUDE_CODE_LAUNCHER = fileURLToPath(
 // The BWS broker execs the keyless bridge for every Vibe and opencode-go
 // attempt, so the bridge's own exit status and last line reach the runner.
 const KEYLESS_BRIDGE_BROKER = "/Users/dave/.agent/bin/bws-secret-exec";
+const NATIVE_LAUNCHERS = Object.freeze([
+	VIBE_CODE_LAUNCHER,
+	CLAUDE_CODE_LAUNCHER,
+]);
 
 function remainingMs(deadlineMs, now) {
 	return Math.max(0, deadlineMs - now());
@@ -348,6 +352,7 @@ export async function defaultExecuteProvider(context) {
 				exitCode: result.code,
 				signal: result.signal,
 				keylessBridge: invocation.command === KEYLESS_BRIDGE_BROKER,
+				nativeLauncher: NATIVE_LAUNCHERS.includes(invocation.args?.[0]),
 				timedOut: result.timedOut === true,
 			})
 		: null;
