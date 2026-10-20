@@ -1,7 +1,12 @@
 import { resolveTargetId } from "../roster/index.mjs";
-import { closedReason, createRouteEvidenceCapture } from "./route-evidence.mjs";
+import {
+	boundedExclusions,
+	closedReason,
+	createRouteEvidenceCapture,
+} from "./route-evidence.mjs";
 
 const LIMIT = 64;
+const HEALTH = "route_health_suppressed";
 
 /**
  * Deduplicate and bound exclusion entries while preserving precedence.
@@ -12,7 +17,6 @@ function deduplicateRefusals(entries = [], limit = LIMIT) {
 	const seen = new Set();
 	const result = [];
 	for (const entry of entries) {
-		if (result.length >= limit) break;
 		if (!entry || typeof entry !== "object") continue;
 		const targetId = resolveTargetId(entry.targetId);
 		if (!targetId || !/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(targetId)) continue;
@@ -27,7 +31,7 @@ function deduplicateRefusals(entries = [], limit = LIMIT) {
 			...(bucket ? { bucket } : {}),
 		});
 	}
-	return result;
+	return boundedExclusions(result, limit);
 }
 
 /**
@@ -35,12 +39,19 @@ function deduplicateRefusals(entries = [], limit = LIMIT) {
  */
 export function createRefusalAccumulator(initial = []) {
 	const map = new Map();
+	let healthCount = 0;
 	function add(targetIdInput, reason, bucket = null) {
 		const targetId = resolveTargetId(targetIdInput);
 		if (!targetId || !/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(targetId)) return;
 		const validBucket = bucket === "ac" || bucket === "ap" ? bucket : null;
 		const key = `${targetId}:${validBucket ?? ""}:${closedReason(reason)}`;
-		if (map.has(key) || map.size >= LIMIT) return;
+		const health = closedReason(reason) === HEALTH;
+		if (
+			map.has(key) ||
+			(health ? healthCount : map.size - healthCount) >= LIMIT
+		)
+			return;
+		if (health) healthCount += 1;
 		map.set(key, {
 			targetId,
 			reason: closedReason(reason),
@@ -53,7 +64,7 @@ export function createRefusalAccumulator(initial = []) {
 	return {
 		add,
 		entries(limit = LIMIT) {
-			return Array.from(map.values()).slice(0, limit);
+			return boundedExclusions(Array.from(map.values()), limit);
 		},
 	};
 }

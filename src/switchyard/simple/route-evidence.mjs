@@ -61,6 +61,21 @@ const STATUSES = new Set([
 	"not_checked",
 ]);
 const finite = (value) => (Number.isFinite(value) ? value : null);
+const isHealth = (entry) => entry?.reason === "route_health_suppressed";
+
+/**
+ * Bound exclusion entries in order. Over the bound, other entries are
+ * dropped before a health entry: the simple pass reads route health from
+ * this evidence, so the bound must never turn a health block into a missing
+ * provider (Codex review, 2026-10-19).
+ */
+export function boundedExclusions(entries, limit = LIMIT) {
+	if (entries.length <= limit) return entries;
+	let room = Math.max(0, limit - entries.filter(isHealth).length);
+	return entries
+		.filter((entry) => isHealth(entry) || room-- > 0)
+		.slice(0, limit);
+}
 export const closedReason = (value) =>
 	typeof value === "string" &&
 	value.startsWith("no_eligible_upstream_unavailable:")
@@ -153,10 +168,9 @@ export function routeDiagnosticPatch(routed) {
 			candidate?.priority,
 		);
 	}
-	for (const entry of (Array.isArray(evidence.excluded)
-		? evidence.excluded
-		: []
-	).slice(0, LIMIT)) {
+	for (const entry of boundedExclusions(
+		Array.isArray(evidence.excluded) ? evidence.excluded : [],
+	)) {
 		capture.exclude(entry?.targetId, entry?.reason, entry?.bucket);
 	}
 	const bounded = capture.finish({

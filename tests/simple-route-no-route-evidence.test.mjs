@@ -10,6 +10,8 @@ import {
 } from "../src/switchyard/roster/index.mjs";
 import { route } from "../src/switchyard/router/index.mjs";
 import { SIMPLE_TARGET_ADAPTERS } from "../src/switchyard/simple/args.mjs";
+import { routeDiagnosticPatch } from "../src/switchyard/simple/route-evidence.mjs";
+import { createSimpleRouteSelection } from "../src/switchyard/simple/route-selection.mjs";
 import { runSimpleRoutingTask } from "../src/switchyard/simple/routing-run.mjs";
 import { realSelectionEngine } from "./helpers/real-route-selection.mjs";
 import { withDispatchQualifiedDescriptors } from "./helpers/router-fixtures.mjs";
@@ -184,6 +186,88 @@ test("a router without evidence still leaves no considered target unnamed", asyn
 		Object.keys(named).sort(),
 		SIMPLE_TARGET_ADAPTERS.map((adapter) => adapter.targetId).sort(),
 	);
+});
+
+// Codex review (2026-10-19): with the evidence bound nearly full, the added
+// report entries pushed the router's health entry past it, and a health block
+// was reported as no_eligible_provider. 57 exclusions is the most the
+// previous release still kept ahead of the health entry; 63 fills the
+// router's own 64-entry bound, where that release already lost it.
+const fillerReasons = [
+	"no_quota_headroom",
+	"budget_pace_exceeded",
+	"provider_unavailable",
+	"qualification_missing",
+	"qualification_expired",
+	"not_configured",
+	"no_valid_windows",
+	"accounting_bucket_unavailable",
+];
+function healthBoundRouter(fillerCount) {
+	const filler = fillerReasons
+		.flatMap((reason) =>
+			SIMPLE_TARGET_ADAPTERS.map(({ targetId }) => ({ targetId, reason })),
+		)
+		.slice(0, fillerCount);
+	return () => ({
+		provider: null,
+		reason: "no_eligible",
+		routeEvidence: {
+			schemaVersion: 1,
+			candidates: [],
+			excluded: [
+				...filler,
+				{ targetId: "codex", reason: "route_health_suppressed" },
+			],
+		},
+	});
+}
+
+for (const fillerCount of [57, 63])
+	test(`report-only evidence never hides a health block behind ${fillerCount} exclusions`, async () => {
+		const { selectSimpleRoute } = createSimpleRouteSelection({
+			options: {
+				capability: "standard",
+				projectPath: tempDir("switchyard-health-bound-project-"),
+				checks: [],
+				deadlineMs: Date.now() + 3_600_000,
+			},
+			resolveIdentity: resolveTargetIdentity,
+			descriptorFor: getConfiguredInvocationDescriptor,
+			routeProvider: healthBoundRouter(fillerCount),
+			healthController: { prepare: async () => ({ allowed: true }) },
+			now: Date.now,
+			stateRoot: tempDir("switchyard-health-bound-state-"),
+			funded: () => {},
+			onDecision: async () => {},
+		});
+		deepStrictEqual(await selectSimpleRoute(), {
+			error: "route_health_blocked",
+		});
+	});
+
+test("the evidence bound keeps a raw router's health entry and the order of the rest", () => {
+	const routed = healthBoundRouter(64)();
+	const excluded = routeDiagnosticPatch(routed).routeEvidence.excluded;
+	strictEqual(excluded.length, 64);
+	deepStrictEqual(
+		excluded.slice(0, 63),
+		routed.routeEvidence.excluded.slice(0, 63),
+	);
+	deepStrictEqual(excluded[63], {
+		targetId: "codex",
+		reason: "route_health_suppressed",
+	});
+});
+
+test("a routing run keeps a health block at the evidence bound", async () => {
+	const f = highFixture({ capability: "standard" });
+	f.deps.route = healthBoundRouter(57);
+	const result = await runSimpleRoutingTask(f.options, f.deps);
+	deepStrictEqual(f.calls, []);
+	strictEqual(result.result.failureReason, "route_health_blocked");
+	// The previous release's direction for the same input.
+	strictEqual(result.direction, "native_required");
 });
 
 test("the router names an offered target missing from the usage snapshot without changing its choice", () => {
