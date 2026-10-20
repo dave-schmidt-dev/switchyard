@@ -1,7 +1,7 @@
 // @test-phase: other
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { basename, isAbsolute, join } from "node:path";
 import { test } from "node:test";
@@ -13,6 +13,7 @@ import {
 } from "../src/switchyard/adapter/exec-error.mjs";
 import { resolveFailure } from "../src/switchyard/diagnostics/failure-registry.mjs";
 import { readRun } from "../src/switchyard/run-store/index.mjs";
+import { getRunRoot } from "../src/switchyard/run-store/run-records.mjs";
 import { dryRunAcceptanceChecks } from "../src/switchyard/simple/check-dry-run.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
 import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
@@ -190,6 +191,25 @@ test("the terminal result carries the same durable failureDetails as run.json", 
 		!JSON.stringify(result.failureDetails).includes(SETUP_ERROR_MESSAGE_CANARY),
 		"terminal failureDetails never carries the thrown message",
 	);
+});
+
+// check_setup_failed runs showed `causeCode: unknown` when run.json was read
+// raw. The file keeps the previous release's stand-in in lastFailure so a
+// rolled-back reader still accepts it; the precise cause is in
+// failureDetails.causeCode, and readRun restores it.
+test("a check-setup failure keeps its precise cause through run.json", async () => {
+	const { result, run } = await runSetupFailure({ code: "ENOENT" });
+	strictEqual(result.providerReliability.causeCode, "check_setup_failed");
+	const disk = JSON.parse(
+		readFileSync(join(getRunRoot(result.runId), "run.json"), "utf8"),
+	);
+	strictEqual(disk.lastFailure.providerReliability.causeCode, "unknown");
+	strictEqual(disk.failureDetails.causeCode, "check_setup_failed");
+	strictEqual(
+		run.lastFailure.providerReliability.causeCode,
+		"check_setup_failed",
+	);
+	strictEqual(run.lastFailure.providerReliability.causeCategory, "environment");
 });
 
 test("a cancelled provider result persists its resolved cancel source", async () => {
