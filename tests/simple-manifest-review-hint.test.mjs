@@ -120,7 +120,11 @@ test("the hint names exact paths, shell-quoted, and counts the ones it cannot na
 	ok(!manifestReviewHint(["package.json"]).includes("more"));
 	strictEqual(
 		manifestReviewHint(["\u202e.sh"]),
-		"review each changed manifest, then rerun with --allow-manifest=<path> for each one to allow it",
+		"review the 1 changed manifest, then rerun with --allow-manifest=<path> for each one to allow it",
+	);
+	strictEqual(
+		manifestReviewHint(["\u202e.sh", "b\u0007.sh"]),
+		"review the 2 changed manifests, then rerun with --allow-manifest=<path> for each one to allow it",
 	);
 });
 

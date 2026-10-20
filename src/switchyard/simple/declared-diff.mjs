@@ -108,7 +108,7 @@ function manifestReviewHint(paths) {
 			listed.push(path);
 	}
 	if (listed.length === 0)
-		return "review each changed manifest, then rerun with --allow-manifest=<path> for each one to allow it";
+		return `review the ${paths.length} changed manifest${paths.length === 1 ? "" : "s"}, then rerun with --allow-manifest=<path> for each one to allow it`;
 	const flags = listed.map(
 		(path) =>
 			`--allow-manifest=${SHELL_SAFE_PATH.test(path) ? path : `'${path.replaceAll("'", "'\\''")}'`}`,
