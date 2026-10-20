@@ -217,6 +217,9 @@ export function createSimpleRouteSelection({
 					: { healthDecision: healthController.decision }),
 				only: options.onlyProviders ?? [],
 				exclude: [...excludedSimpleTargets],
+				// Diagnostic only: refusals already known for this call, so the
+				// routing run can persist the complete per-call record.
+				refusals: [...refusals.entries(), ...selectionEvidence()],
 			});
 			routed = withSelectionEvidence(routed);
 			await onDecision(routed);

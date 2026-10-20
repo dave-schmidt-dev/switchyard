@@ -7,6 +7,7 @@ import { parseRfc3339 } from "../rfc3339.mjs";
 import { getStateRoot } from "../run-store/project-lock-files.mjs";
 import { NON_BLAMING_CAUSES } from "./attempt-blame.mjs";
 import { CHECK_ENVIRONMENT_SIGNATURES } from "./check-environment.mjs";
+import { readRouteRefusals } from "./routing-state-refusals.mjs";
 import {
 	acquireRoutingFileLock,
 	ensureSafeRoutingDirectories,
@@ -445,6 +446,18 @@ export function readRoutingRunState(project, runId, { stateRoot } = {}) {
 	const dir = runPath(project, runId, stateRoot);
 	if (!ensureSafeRoutingDirectories(dir, false)) return null;
 	return readState(dir, project, runId);
+}
+/**
+ * The routing run's per-route-call refusal records (diagnostic only, kept
+ * beside state.json; see routing-state-refusals.mjs). Never throws for a
+ * missing or malformed record file.
+ */
+export function readRoutingRunRefusals(project, runId, { stateRoot } = {}) {
+	project = canonicalRoutingProject(project);
+	validateRoutingRunId(runId);
+	const dir = runPath(project, runId, stateRoot);
+	if (!ensureSafeRoutingDirectories(dir, false)) return [];
+	return readRouteRefusals(dir);
 }
 /**
  * Close the pending attempt with its terminal record.

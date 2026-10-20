@@ -45,6 +45,8 @@ const REASONS = new Set([
 	"funding_unavailable",
 	"funding_exhausted",
 	"tier_excluded",
+	"failed_this_task",
+	"failed_in_routing_run",
 	"unknown",
 ]);
 const STATUSES = new Set([

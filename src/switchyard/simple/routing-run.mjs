@@ -31,6 +31,7 @@ import {
 	openRoutingRun,
 	recordAttemptOutcome,
 } from "./routing-state.mjs";
+import { appendRouteRefusals } from "./routing-state-refusals.mjs";
 import {
 	createFailureLogAppender,
 	failureAttemptRecord,
@@ -163,8 +164,20 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 	const resolveIdentity = deps.resolveTargetIdentity ?? resolveTargetIdentity;
 	const select = deps.route ?? route;
 	const funded = deps.assertFundedRoute ?? assertFundedRoute;
-	const localExcluded = new Set();
+	// Targets this invocation removed, each with the closed reason it reports.
+	const localExcluded = new Map();
 	const refusals = createRefusalAccumulator();
+	// Refusal records are diagnostic: a failed write warns and never changes
+	// the route.
+	const recordRefusals = (record) => {
+		try {
+			appendRouteRefusals(handle.runDir, record);
+		} catch (error) {
+			(deps.onRoutingWarning ?? console.error)(
+				`dispatch: route refusal record unavailable (${typeof error?.code === "string" && /^[a-z_]+$/u.test(error.code) ? error.code : "unknown"})`,
+			);
+		}
+	};
 	let routingDiagnostics = {};
 	const logicalTaskId = taskBinding?.taskId ?? deps.taskId ?? randomUUID();
 	// Task 3.11: the newest retained partial this invocation may carry, and
@@ -216,6 +229,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 				funded,
 				localExcluded,
 				refusals,
+				recordRefusals,
 				now,
 				setDiagnostics: (patch) => {
 					routingDiagnostics = patch;
@@ -389,7 +403,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 			if (!failed) return answer("complete", { result });
 
 			// Always exclude from this invocation's local set regardless of severity.
-			localExcluded.add(pending.targetId);
+			localExcluded.set(pending.targetId, "failed_this_task");
 			// Capacity and caller cancellations are not task failures, so they must
 			// not turn a later no-eligible stop into task_failures.
 			if (nonBlaming === null) anyFailed = true;
