@@ -64,6 +64,12 @@ export function safeWorktree(
 ) {
 	if (typeof path !== "string" || !path.startsWith("/") || path.includes("\0"))
 		fail("worktree must be absolute");
+	// schemePath's JSON escapes for some of these (\u0001, \b, \f, a lone
+	// surrogate's \ud800) are not Seatbelt string escapes, so the profile's
+	// grants and .git denies would name a different path; every control
+	// character is refused. Raw non-ASCII, composed or not, matches as is.
+	if (/\p{Cc}/u.test(path) || !path.isWellFormed())
+		fail("worktree path has a control character or unpaired surrogate");
 	let isCanonical = false;
 	try {
 		isCanonical =

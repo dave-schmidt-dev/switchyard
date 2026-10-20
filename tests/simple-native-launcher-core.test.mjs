@@ -25,6 +25,7 @@ import {
 	schemePath,
 	settleGroup,
 } from "../ops/simple-native-launcher-core.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 function setup() {
 	const root = join(
@@ -351,6 +352,44 @@ setInterval(() => {}, 1000);
 		);
 	} finally {
 		item.cleanup();
+	}
+});
+
+// A clone under a TMPDIR whose name holds one of these passes every other
+// check, so only the character guard keeps it from a mis-decoded profile.
+test("safeWorktree refuses a clone path with a control character or unpaired surrogate", () => {
+	const parent = tempDir("switchyard-odd-tmpdir-");
+	const clone = (segment) => {
+		const root = join(parent, segment, `switchyard-simple-${randomUUID()}`);
+		const worktree = join(root, "worktree");
+		mkdirSync(join(worktree, ".git"), { recursive: true });
+		writeFileSync(join(root, ".switchyard-cleanup-owner.json"), "{}\n");
+		return worktree;
+	};
+	for (const segment of [
+		"a\u0001b",
+		"a\bb",
+		"a\fb",
+		"a\tb",
+		"a\nb",
+		"a\x7fb",
+		"a\u0085b",
+		"a\ud800b",
+	]) {
+		const worktree = clone(segment);
+		assert.throws(
+			() => safeWorktree(worktree),
+			{
+				message:
+					"simple-native-launcher-core: worktree path has a control character or unpaired surrogate",
+			},
+			JSON.stringify(segment),
+		);
+	}
+	// Seatbelt matches raw non-ASCII, composed or not, so these stay valid.
+	for (const segment of ["café", "café", "漢字", "a]b"]) {
+		const worktree = clone(segment);
+		assert.equal(safeWorktree(worktree), worktree, JSON.stringify(segment));
 	}
 });
 
