@@ -205,4 +205,100 @@ describe("run records stay readable by frozen releases", () => {
 		// Reading never rewrites the file.
 		strictEqual(readFileSync(runJsonPath(opts.runId), "utf8"), raw);
 	});
+
+	// The frozen release accepts only the registry reason, so the executable
+	// mismatch line stays off disk at any path depth and returns on read.
+	for (const [label, root] of [
+		["shallow", "/checker"],
+		["deep", `/${"d".repeat(300)}`],
+	]) {
+		it(`keeps a ${label} executable mismatch frozen-readable`, async () => {
+			const opts = makeOptions({ orderedTaskIds: ["task-1"] });
+			await initializeRun(opts);
+			const checkExecutable = `${root}/runtime/bin/xcrun`;
+			const hostExecutable = "/usr/bin/xcrun";
+			const base = sanitizeFailureMetadata({
+				result: "execution_failed",
+				errorKind: "environment_failure",
+			}).reason;
+			const lastFailure = sanitizeFailureMetadata({
+				result: "execution_failed",
+				errorKind: "environment_failure",
+				checkExecutable,
+				hostExecutable,
+			});
+			ok(lastFailure.reason.startsWith(`${base}\n`));
+			ok(lastFailure.reason.includes(checkExecutable));
+			await updateRunWithRetry(opts.runId, {
+				state: "failed",
+				lastFailure,
+				failureDetails: {
+					failureReason: "check_environment_failed",
+					checkExecutable,
+					hostExecutable,
+				},
+			});
+			const disk = onDisk(opts.runId);
+			strictEqual(disk.lastFailure.reason, base);
+			strictEqual(disk.failureDetails.checkExecutable, checkExecutable);
+			assertFrozenReadersAccept(disk, label);
+
+			const read = await readRun(opts.runId);
+			strictEqual(read.lastFailure.reason, lastFailure.reason);
+			deepStrictEqual(onDisk(opts.runId), disk);
+
+			await updateRunWithRetry(opts.runId, { cleanupState: "complete" });
+			const rewritten = onDisk(opts.runId);
+			strictEqual(rewritten.lastFailure.reason, base);
+			assertFrozenReadersAccept(rewritten, `${label} after update`);
+			strictEqual(
+				(await readRun(opts.runId)).lastFailure.reason,
+				lastFailure.reason,
+			);
+		});
+	}
+
+	it("never restores a line the validator would split differently", async () => {
+		const opts = makeOptions({ orderedTaskIds: ["task-1"] });
+		await initializeRun(opts);
+		const lastFailure = sanitizeFailureMetadata({
+			result: "execution_failed",
+			errorKind: "environment_failure",
+		});
+		const segments = (letter) => `${letter.repeat(100)}/`.repeat(6);
+		await updateRunWithRetry(opts.runId, {
+			state: "failed",
+			lastFailure,
+			failureDetails: {
+				failureReason: "check_environment_failed",
+				checkExecutable: `/x in the check sandbox but /${segments("a")}tool`,
+				hostExecutable: `/${segments("b")}tool`,
+			},
+		});
+		strictEqual(
+			(await readRun(opts.runId)).lastFailure.reason,
+			lastFailure.reason,
+		);
+	});
+
+	it("keeps a mismatch line its details cannot rebuild", async () => {
+		const opts = makeOptions({ orderedTaskIds: ["task-1"] });
+		await initializeRun(opts);
+		const lastFailure = sanitizeFailureMetadata({
+			result: "execution_failed",
+			errorKind: "environment_failure",
+			checkExecutable: "/checker/runtime/bin/xcrun",
+			hostExecutable: "/usr/bin/xcrun",
+		});
+		await updateRunWithRetry(opts.runId, {
+			state: "failed",
+			lastFailure,
+			failureDetails: { failureReason: "check_environment_failed" },
+		});
+		strictEqual(onDisk(opts.runId).lastFailure.reason, lastFailure.reason);
+		strictEqual(
+			(await readRun(opts.runId)).lastFailure.reason,
+			lastFailure.reason,
+		);
+	});
 });

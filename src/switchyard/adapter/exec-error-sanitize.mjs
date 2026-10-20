@@ -43,7 +43,11 @@ const DETAIL_PATH_LIMIT = 5;
 const DETAIL_PATH_MAX_CHARS = 200;
 const CHECK_SETUP_EXECUTABLE_MAX_CHARS = 64;
 const CHECK_SETUP_TOKEN_RE = /^[A-Za-z0-9_]{1,64}$/u;
-const CHECK_EXECUTABLE_MAX_CHARS = 256;
+// Evidence and executable references are filesystem paths a captain opens, so
+// they are bounded by macOS PATH_MAX rather than the generic detail bound: a
+// deep owned scratch root (a 115-character TMPDIR) pushes a check-evidence
+// path past 256 characters, and a truncated path cannot be opened.
+const DETAIL_PATH_REFERENCE_MAX_CHARS = 1024;
 const CHECK_EXECUTABLE_LINE_PREFIX = "check command resolves to ";
 const CHECK_EXECUTABLE_LINE_MIDDLE = " in the check sandbox but ";
 const CHECK_EXECUTABLE_LINE_SUFFIX = " on the host.";
@@ -64,7 +68,7 @@ const hasControlChars = (value) => /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value);
 
 function sanitizeAbsoluteDetailPath(value) {
 	return typeof value === "string" &&
-		value.length <= CHECK_EXECUTABLE_MAX_CHARS &&
+		value.length <= DETAIL_PATH_REFERENCE_MAX_CHARS &&
 		isAbsolute(value) &&
 		!hasControlChars(value)
 		? value
@@ -149,6 +153,14 @@ function sanitizeDetailValue(field, value) {
 			: undefined;
 	if (field === "checkExecutable" || field === "hostExecutable")
 		return sanitizeAbsoluteDetailPath(value);
+	// Earlier releases persisted any bounded string here, so only the bound
+	// differs from the generic rule.
+	if (field === "outputPath")
+		return typeof value === "string" &&
+			value.length <= DETAIL_PATH_REFERENCE_MAX_CHARS &&
+			!hasControlChars(value)
+			? value
+			: undefined;
 	return typeof value === "string" &&
 		value.length <= DETAIL_STRING_MAX_CHARS &&
 		!hasControlChars(value)
@@ -556,17 +568,55 @@ const LEGACY_LAST_FAILURE_DETAIL_KEYS = Object.freeze([
 const isPlainObject = (value) =>
 	value !== null && typeof value === "object" && !Array.isArray(value);
 
+// The registry reason and the reason with the executable mismatch line that
+// `failureDetails` rebuilds exactly, or null when the details name no pair.
+function executableReasonParts(record) {
+	const lastFailure = record.lastFailure;
+	if (!isPlainObject(lastFailure) || typeof lastFailure.reason !== "string")
+		return null;
+	const details = isPlainObject(record.failureDetails)
+		? record.failureDetails
+		: null;
+	const line = checkExecutableMessageLine(
+		details?.checkExecutable,
+		details?.hostExecutable,
+	);
+	if (line === null) return null;
+	const base = sanitizeFailureMetadata({
+		result: "execution_failed",
+		errorKind: lastFailure.errorKind,
+	})?.reason;
+	if (typeof base !== "string") return null;
+	// A path holding the line's own separator rebuilds a reason the validator
+	// splits differently; such a pair is neither left off nor restored.
+	const full = `${base}\n${line}`;
+	return isCheckExecutableMessage(full, base) ? { base, full } : null;
+}
+
 /**
  * Returns the on-disk form of a run record: a copy whose
  * `lastFailure.providerReliability` uses only frozen cause codes, with the
- * precise code in `failureDetails.causeCode`. Returns `record` itself when
- * nothing changes, and never mutates it.
+ * precise code in `failureDetails.causeCode`, and whose `lastFailure.reason`
+ * leaves off the executable mismatch line when `failureDetails` rebuilds it
+ * exactly. The frozen release accepts only the registry reason; the read
+ * upgrade appends the line again. Returns `record` itself when nothing
+ * changes, and never mutates it.
  *
  * @param {object} record In-memory run record.
  * @returns {object} The record to serialize.
  */
 export function projectRunFailureForDisk(record) {
 	if (!isPlainObject(record)) return record;
+	const projected = projectCauseCodeForDisk(record);
+	const parts = executableReasonParts(projected);
+	if (!parts || projected.lastFailure.reason !== parts.full) return projected;
+	return {
+		...projected,
+		lastFailure: { ...projected.lastFailure, reason: parts.base },
+	};
+}
+
+function projectCauseCodeForDisk(record) {
 	const reliability = isPlainObject(record.lastFailure)
 		? record.lastFailure.providerReliability
 		: undefined;
@@ -597,8 +647,9 @@ export function projectRunFailureForDisk(record) {
 
 /**
  * Upgrades a parsed run.json in memory, never on disk: lifts legacy detail
- * keys out of `lastFailure` into `failureDetails`, and restores a precise
- * cause code that `projectRunFailureForDisk` stored as the frozen stand-in.
+ * keys out of `lastFailure` into `failureDetails`, restores a precise cause
+ * code that `projectRunFailureForDisk` stored as the frozen stand-in, and
+ * appends the executable mismatch line it left off the reason.
  *
  * @param {object} record Parsed run.json object; mutated in place.
  * @returns {object} The same object.
@@ -636,5 +687,8 @@ export function upgradeRunFailureFromDisk(record) {
 			causeCategory: causeCategoryFor(preciseCode),
 		};
 	}
+	const parts = executableReasonParts(record);
+	if (parts && lastFailure.reason === parts.base)
+		lastFailure.reason = parts.full;
 	return record;
 }

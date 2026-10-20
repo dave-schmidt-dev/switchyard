@@ -45,7 +45,8 @@ function refused(code, details = null) {
 
 /** Longest a sandbox executable-resolution probe may run. */
 const RESOLVE_EXECUTABLE_PROBE_CAP_MS = 30_000;
-const MAX_EXECUTABLE_PATH_CHARS = 256;
+// macOS PATH_MAX; the persisted executable reference uses the same bound.
+const MAX_EXECUTABLE_PATH_CHARS = 1024;
 const CHECK_SETUP_EXECUTABLE_MAX_CHARS = 64;
 
 /** One `command -v` answer, only when it is a bounded absolute path. */
