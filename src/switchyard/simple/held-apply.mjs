@@ -201,13 +201,35 @@ export async function applyHeldIntegration(
 	}
 	const finish = async (result) => {
 		const finishedAt = new Date(now()).toISOString();
+		// As in the simple run's own cleanup: a lock this apply took but could
+		// not confirm released, or a retained checker, is a cleanup failure, so
+		// recovery never reads the leftover as a clean terminal run.
+		const cleanupResult =
+			result.lockReleased === false
+				? "project_lock_release_unconfirmed"
+				: result.checker === "retained"
+					? "worktree_cleanup_failed"
+					: null;
+		const cleanup = cleanupResult
+			? {
+					cleanupState: "failed",
+					cleanupFailure: {
+						...sanitizeFailureMetadata({
+							result: cleanupResult,
+							errorKind: "cleanup_failed",
+							failurePhase: "cleanup",
+						}),
+						result: cleanupResult,
+					},
+				}
+			: { cleanupState: "complete" };
 		try {
 			await updateRun(
 				applyRunId,
 				result.ok
 					? {
 							state: "succeeded",
-							cleanupState: "complete",
+							...cleanup,
 							finishedAt,
 							terminalSummary: {
 								status: "held_applied",
@@ -218,8 +240,7 @@ export async function applyHeldIntegration(
 						}
 					: {
 							state: "failed",
-							cleanupState:
-								result.checker === "retained" ? "failed" : "complete",
+							...cleanup,
 							finishedAt,
 							lastFailure: sanitizeFailureMetadata({
 								result: result.reason,

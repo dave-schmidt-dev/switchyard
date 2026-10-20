@@ -1,6 +1,7 @@
 // @test-phase: other
 // Held-apply safety: a held receipt is bound to the run asked for, its store
-// directory is never followed through a symlink, an apply that cannot record
+// directory is never followed through a symlink or swapped under a write, an
+// unconfirmed lock release fails cleanup, an apply that cannot record
 // its outcome blocks every later apply, a failed mutating `git apply` is
 // reported as unknown, and a recheck passes only with its checker stopped.
 import { strictEqual, throws } from "node:assert";
@@ -8,11 +9,13 @@ import {
 	existsSync,
 	mkdirSync,
 	readFileSync,
+	renameSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
+import { releaseProjectLockIfOwnedBy } from "../src/switchyard/run-store/project-locks.mjs";
 import {
 	getRunRoot,
 	readRun,
@@ -60,37 +63,79 @@ test("another run's record at the requested run id is refused", async () => {
 	strictEqual(read(repo), "base\n");
 });
 
+function holdInput(repo, runId) {
+	const head = git(repo.projectPath, ["rev-parse", "HEAD"]);
+	return {
+		runId,
+		taskId: "t",
+		attemptId: "a",
+		projectPath: repo.projectPath,
+		diff: "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-base\n+candidate\n",
+		baseRevision: head,
+		verifiedHead: head,
+		files: ["a.txt"],
+		scopeFiles: ["a.txt"],
+		readOnlyInputs: [],
+		allowManifests: [],
+		allowExecutables: [],
+		checks: [],
+		changedFiles: ["a.txt"],
+		undeclaredPaths: [],
+		declaredFingerprint: "unused",
+		expectedOutputs: [],
+	};
+}
+
+function assertProjectUntouched(repo) {
+	strictEqual(existsSync(join(repo.projectPath, "held.patch")), false);
+	strictEqual(existsSync(join(repo.projectPath, "receipt.json")), false);
+	strictEqual(git(repo.projectPath, ["status", "--porcelain"]), "");
+}
+
 test("hold refuses a planted held-integration symlink instead of following it", () => {
 	const repo = heldFixture();
 	const runId = "simple-held-planted-symlink";
 	mkdirSync(getRunRoot(runId), { recursive: true, mode: 0o700 });
 	symlinkSync(repo.projectPath, join(getRunRoot(runId), "held-integration"));
-	const head = git(repo.projectPath, ["rev-parse", "HEAD"]);
-	const diff = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-base\n+candidate\n";
-	throws(() =>
-		holdVerifiedIntegration({
-			runId,
-			taskId: "t",
-			attemptId: "a",
-			projectPath: repo.projectPath,
-			diff: `diff --git a/a.txt b/a.txt\n${diff}`,
-			baseRevision: head,
-			verifiedHead: head,
-			files: ["a.txt"],
-			scopeFiles: ["a.txt"],
-			readOnlyInputs: [],
-			allowManifests: [],
-			allowExecutables: [],
-			checks: [],
-			changedFiles: ["a.txt"],
-			undeclaredPaths: [],
-			declaredFingerprint: "unused",
-			expectedOutputs: [],
-		}),
+	throws(() => holdVerifiedIntegration(holdInput(repo, runId)));
+	assertProjectUntouched(repo);
+});
+
+test("hold writes nothing when its directory is swapped after creation", () => {
+	const repo = heldFixture();
+	const runId = "simple-held-swapped-directory";
+	mkdirSync(getRunRoot(runId), { recursive: true, mode: 0o700 });
+	throws(
+		() =>
+			holdVerifiedIntegration(holdInput(repo, runId), {
+				beforeWrite: (directory) => {
+					renameSync(directory, `${directory}.moved`);
+					symlinkSync(repo.projectPath, directory);
+				},
+			}),
+		{ code: "held_directory_unsafe" },
 	);
-	strictEqual(existsSync(join(repo.projectPath, "held.patch")), false);
-	strictEqual(existsSync(join(repo.projectPath, "receipt.json")), false);
-	strictEqual(git(repo.projectPath, ["status", "--porcelain"]), "");
+	assertProjectUntouched(repo);
+});
+
+test("an unconfirmed lock release fails the apply run's cleanup", async () => {
+	const { repo, result } = await held();
+	const applied = await apply(repo, result.runId, {
+		releaseProjectLock: async () => false,
+	});
+	try {
+		strictEqual(applied.state, "applied");
+		strictEqual(applied.lockReleased, false);
+		const record = await readRun(applied.applyRunId);
+		strictEqual(record.state, "succeeded");
+		strictEqual(record.cleanupState, "failed");
+		strictEqual(
+			record.cleanupFailure.result,
+			"project_lock_release_unconfirmed",
+		);
+	} finally {
+		await releaseProjectLockIfOwnedBy(repo.projectPath, applied.applyRunId);
+	}
 });
 
 test("an apply whose outcome is unknown blocks every later apply", async () => {

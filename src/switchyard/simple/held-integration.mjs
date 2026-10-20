@@ -42,9 +42,25 @@ function heldPaths(runId) {
 	};
 }
 
-function writeSynced(path, bytes) {
-	const fd = openSync(path, "wx", 0o600);
+// Create `path` exclusively inside the directory `identity` names. No byte is
+// written until the directory is still that one and the new file is the one
+// the path now names, so a directory swapped for a symlink receives nothing.
+function writeSynced(path, bytes, identity) {
+	sameDirectory(dirname(path), identity);
+	const fd = openSync(
+		path,
+		constants.O_WRONLY |
+			constants.O_CREAT |
+			constants.O_EXCL |
+			constants.O_NOFOLLOW,
+		0o600,
+	);
 	try {
+		sameDirectory(dirname(path), identity);
+		const opened = fstatSync(fd);
+		const named = lstatSync(path);
+		if (opened.dev !== named.dev || opened.ino !== named.ino)
+			throw unsafeDirectory();
 		writeSync(fd, bytes);
 		fsyncSync(fd);
 	} finally {
@@ -61,6 +77,11 @@ function syncDirectory(path) {
 	}
 }
 
+const unsafeDirectory = () =>
+	Object.assign(new Error("held directory is not owner-only"), {
+		code: "held_directory_unsafe",
+	});
+
 function ownedDirectory(path) {
 	const stats = lstatSync(path);
 	if (
@@ -68,19 +89,24 @@ function ownedDirectory(path) {
 		stats.isSymbolicLink() ||
 		stats.uid !== process.getuid()
 	)
-		throw Object.assign(new Error("held directory is not owner-only"), {
-			code: "held_directory_unsafe",
-		});
+		throw unsafeDirectory();
+	return { dev: stats.dev, ino: stats.ino };
 }
 
-// The held directory is created once, by this run, inside its own run root.
-// A pre-existing entry (a symlink planted into the project, say) is refused
-// rather than followed, and the files are created exclusively, so nothing is
-// ever written outside the run store.
+function sameDirectory(path, identity) {
+	const current = ownedDirectory(path);
+	if (current.dev !== identity.dev || current.ino !== identity.ino)
+		throw unsafeDirectory();
+}
+
+// The held directory is created once, by this run, inside its own run root
+// (which, like run.json, lives under the configured store root). A
+// pre-existing entry, such as a symlink planted into the project, is refused
+// rather than followed, and its identity anchors every later write.
 function createHeldDirectory(directory) {
 	ownedDirectory(dirname(directory));
 	mkdirSync(directory, { mode: 0o700 });
-	ownedDirectory(directory);
+	return ownedDirectory(directory);
 }
 
 /**
@@ -88,7 +114,10 @@ function createHeldDirectory(directory) {
  * project, then persist the patch and its receipt. A gate refusal returns
  * `{ ok: false, gate }`; a write failure throws.
  */
-export function holdVerifiedIntegration(input, { now = Date.now } = {}) {
+export function holdVerifiedIntegration(
+	input,
+	{ now = Date.now, beforeWrite = () => {} } = {},
+) {
 	const gate = integrationGate(input.diff, input.projectPath, {
 		allowedPaths: input.scopeFiles,
 		allowSensitiveManifests: input.allowManifests.length > 0,
@@ -123,9 +152,11 @@ export function holdVerifiedIntegration(input, { now = Date.now } = {}) {
 		heldAt,
 	};
 	const receiptBytes = Buffer.from(`${JSON.stringify(receipt)}\n`, "utf8");
-	createHeldDirectory(directory);
-	writeSynced(patchPath, patch);
-	writeSynced(receiptPath, receiptBytes);
+	const identity = createHeldDirectory(directory);
+	beforeWrite(directory);
+	writeSynced(patchPath, patch, identity);
+	writeSynced(receiptPath, receiptBytes, identity);
+	sameDirectory(directory, identity);
 	syncDirectory(directory);
 	return {
 		ok: true,
