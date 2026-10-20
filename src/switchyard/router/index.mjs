@@ -405,6 +405,18 @@ export function route(options = {}) {
 				candidate.priority,
 			);
 	}
+	// Evidence only: an offered target with no snapshot entry is never
+	// evaluated above, so name it instead of leaving it out of the record.
+	if (Array.isArray(availableProviders)) {
+		const snapshotTargets = new Set(
+			[...providers.keys()].map((name) => resolveTargetIdentity(name).targetId),
+		);
+		for (const offered of availableProviders) {
+			const targetId = resolveTargetIdentity(offered).targetId;
+			if (targetId && !snapshotTargets.has(targetId))
+				evidence.exclude(offered, "not_in_usage_snapshot");
+		}
+	}
 
 	// Resolve a load-balanced pool by best metric (highest percentLeft),
 	// tie-breaking equal metrics with the documented scorer.

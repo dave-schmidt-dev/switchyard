@@ -47,6 +47,9 @@ const REASONS = new Set([
 	"tier_excluded",
 	"failed_this_task",
 	"failed_in_routing_run",
+	"pin_required",
+	"not_in_usage_snapshot",
+	"not_evaluated",
 	"unknown",
 ]);
 const STATUSES = new Set([

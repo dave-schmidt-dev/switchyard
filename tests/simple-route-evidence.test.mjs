@@ -115,6 +115,8 @@ test("unavailable no-eligible closes provider error text and blind health is eva
 	);
 	deepStrictEqual(none.routeEvidence.excluded, [
 		{ targetId: "codex", reason: "provider_unavailable" },
+		// Offered, but the snapshot has no entry for it.
+		{ targetId: "antigravity", reason: "not_in_usage_snapshot" },
 	]);
 	ok(!JSON.stringify(none.routeEvidence).includes("DO_NOT_PERSIST"));
 	const calls = new Map();

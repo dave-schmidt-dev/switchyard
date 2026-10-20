@@ -10,6 +10,7 @@ import {
 import { liveRouteExhaustion } from "./route-exhaustion.mjs";
 import {
 	createRefusalAccumulator,
+	withoutRemovalArtifacts,
 	withRefusalEvidence,
 } from "./routing-refusals.mjs";
 import { deadlineFitBudgetMs, evaluateDeadlineFit } from "./task-sizing.mjs";
@@ -28,6 +29,22 @@ const closedRouteError = (reason) =>
 		? "no_eligible_provider"
 		: reason;
 
+/**
+ * Why the unpinned default pool leaves an adapter out for `capability`, or
+ * null when it is in the pool. A pinned --only-provider run skips this filter.
+ */
+function defaultPoolRefusal(adapter, capability) {
+	if (adapter.defaultEligible === false) return "pin_required";
+	if (
+		adapter.defaultCapabilities &&
+		!adapter.defaultCapabilities.includes(capability)
+	)
+		return adapter.capabilities && !adapter.capabilities.includes(capability)
+			? "below_required_capability"
+			: "pin_required";
+	return null;
+}
+
 /** The existing local adapter and health selection pass, shared by start reroutes. */
 export function createSimpleRouteSelection({
 	options,
@@ -40,14 +57,16 @@ export function createSimpleRouteSelection({
 	funded,
 	onDecision,
 }) {
-	const requestedSimpleTargets = (options.onlyProviders ?? []).length
+	const pinnedRun = (options.onlyProviders ?? []).length > 0;
+	const requestedSimpleTargets = pinnedRun
 		? options.onlyProviders
 		: SIMPLE_TARGET_ADAPTERS.filter(
-				(adapter) =>
-					adapter.defaultEligible !== false &&
-					(!adapter.defaultCapabilities ||
-						adapter.defaultCapabilities.includes(options.capability)),
+				(adapter) => defaultPoolRefusal(adapter, options.capability) === null,
 			).map((adapter) => adapter.targetId);
+	// Every target this pass considered, so a no-route result names each one.
+	const consideredTargets = pinnedRun
+		? options.onlyProviders
+		: SIMPLE_TARGET_ADAPTERS.map((adapter) => adapter.targetId);
 	const checks = options.checks ?? [];
 	// Decision 4: a caller estimate is target-independent, so an estimate that
 	// cannot fit refuses before any route call — no target is selected, no
@@ -90,6 +109,13 @@ export function createSimpleRouteSelection({
 				pinnedIncompatibility = compatibility.reason;
 		}
 	}
+	if (!pinnedRun)
+		for (const adapter of SIMPLE_TARGET_ADAPTERS) {
+			const reason = defaultPoolRefusal(adapter, options.capability);
+			if (reason === null) continue;
+			adapterEvidence.exclude(adapter.targetId, reason);
+			refusals.add(adapter.targetId, reason);
+		}
 	if (compatibleSimpleTargets.length === 0) {
 		const error = (options.onlyProviders ?? []).length
 			? (pinnedIncompatibility ?? "local_adapter_unavailable")
@@ -185,13 +211,48 @@ export function createSimpleRouteSelection({
 		...quotaExhaustionEvidence,
 		...deadlineFitEvidence,
 	];
+	// A target this pass refused itself is never offered to the router, which
+	// then reports it as adapter_unavailable; it keeps only its own refusal.
+	// A target the engine removed without a reason keeps the router's entry.
+	const refusedBySelection = (name) => {
+		const targetId = resolveIdentity(name).targetId;
+		return [...refusals.entries(), ...selectionEvidence()].some(
+			(entry) => entry.targetId === targetId,
+		);
+	};
 	const withSelectionEvidence = (routed) => {
 		for (const entry of selectionEvidence())
 			refusals.add(entry.targetId, entry.reason, entry.bucket);
-		for (const entry of routeDiagnosticPatch(routed).routeEvidence?.excluded ??
-			[])
+		const evidence = routeDiagnosticPatch(
+			withoutRemovalArtifacts(routed, refusedBySelection),
+		).routeEvidence;
+		for (const entry of evidence?.excluded ?? [])
 			refusals.add(entry.targetId, entry.reason, entry.bucket);
-		return withRefusalEvidence(routed, refusals.entries());
+		const merged = withRefusalEvidence(
+			evidence ? { ...routed, routeEvidence: evidence } : routed,
+			refusals.entries(),
+		);
+		return merged.provider ? merged : withUnevaluatedTargets(merged);
+	};
+	// A no-route result lists every considered target: any the pass and the
+	// router left without a reason is reported as not evaluated.
+	const withUnevaluatedTargets = (routed) => {
+		const named = new Set(
+			[
+				...(routed.routeEvidence?.excluded ?? []),
+				...(routed.routeEvidence?.candidates ?? []),
+			].map((entry) => entry.targetId),
+		);
+		const missing = consideredTargets
+			.map((name) => resolveIdentity(name).targetId)
+			.filter((targetId) => targetId && !named.has(targetId));
+		if (missing.length === 0) return routed;
+		// Kept out of the shared accumulator: a health reroute evaluates them
+		// on the next pass.
+		return withRefusalEvidence(routed, [
+			...refusals.entries(),
+			...missing.map((targetId) => ({ targetId, reason: "not_evaluated" })),
+		]);
 	};
 	const selectSimpleRoute = async () => {
 		const refused = explicitFitRefusal();

@@ -8,8 +8,6 @@ import {
 	__resetRosterCacheForTests,
 	resolveTargetIdentity,
 } from "../src/switchyard/roster/index.mjs";
-import { routeDiagnosticPatch } from "../src/switchyard/simple/route-evidence.mjs";
-import { createSimpleRouteSelection } from "../src/switchyard/simple/route-selection.mjs";
 import { runSimpleRoutingTask } from "../src/switchyard/simple/routing-run.mjs";
 import {
 	openRoutingRun,
@@ -23,13 +21,12 @@ import {
 	ROUTE_REFUSALS_FILE,
 	readRouteRefusals,
 } from "../src/switchyard/simple/routing-state-refusals.mjs";
+import { realSelectionEngine } from "./helpers/real-route-selection.mjs";
 import { withDispatchQualifiedDescriptors } from "./helpers/router-fixtures.mjs";
 import { fixture } from "./helpers/simple-routing-fixture.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
-// Real route-selection, real production router and a fixture snapshot: the
-// stub engine in the shared fixture skips route-selection.mjs, which is where
-// the selector's evidence is merged.
+// Real route-selection, real production router and a fixture snapshot.
 const ENV_KEYS = [
 	"SWITCHYARD_ROSTER_PATH",
 	"SWITCHYARD_SNAPSHOT_PATH_OVERRIDE",
@@ -150,48 +147,6 @@ after(() => {
 	__resetRosterCacheForTests();
 });
 
-/**
- * Engine stand-in that runs the real route-selection pass over the routing
- * waterfall's route seam, then hands the selected target to the shared stub
- * engine, which allocates and closes the attempt.
- */
-function realSelectionEngine(f) {
-	const inner = f.deps.runSimpleTask;
-	return async (opts, context) => {
-		let diagnostics = {};
-		const { selectSimpleRoute } = createSimpleRouteSelection({
-			options: opts,
-			resolveIdentity: resolveTargetIdentity,
-			descriptorFor: (targetId) => DESCRIPTORS[targetId] ?? null,
-			routeProvider: context.route,
-			healthController: { prepare: async () => ({ allowed: true }) },
-			now: context.now,
-			stateRoot: f.deps.stateRoot,
-			funded: context.assertFundedRoute ?? (() => {}),
-			onDecision: async (routed) => {
-				diagnostics = routeDiagnosticPatch(routed);
-			},
-		});
-		const selected = await selectSimpleRoute();
-		if (selected.error)
-			return {
-				status: "failed",
-				failurePhase: "route",
-				failureReason: selected.error,
-				partialWorktree: null,
-				...diagnostics,
-			};
-		const result = await inner(opts, {
-			...context,
-			route: () => ({
-				provider: selected.provider,
-				resolvedTargetId: selected.targetId,
-			}),
-		});
-		return Object.assign(result, diagnostics);
-	};
-}
-
 function p6Fixture() {
 	writeSnapshot([
 		{ name: "antigravity", ok: true, windows: [window(80)] },
@@ -217,7 +172,10 @@ function p6Fixture() {
 				code: "included_usage_unverified",
 			});
 	};
-	f.deps.runSimpleTask = realSelectionEngine(f);
+	f.deps.runSimpleTask = realSelectionEngine(
+		f,
+		(targetId) => DESCRIPTORS[targetId] ?? null,
+	);
 	f.deps.onRoutingWarning = () => {};
 	return f;
 }
