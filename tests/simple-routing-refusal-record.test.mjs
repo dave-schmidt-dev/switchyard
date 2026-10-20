@@ -1,4 +1,4 @@
-// @test-phase: serial
+// @test-phase: other
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
