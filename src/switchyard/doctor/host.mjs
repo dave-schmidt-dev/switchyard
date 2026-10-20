@@ -1,18 +1,17 @@
 /**
  * Host probes for the full `switchyard doctor`: the quick-check sandbox
- * toolchain, provider CLI versions, bridge content pins and LaunchAgents.
+ * toolchain, the provider CLI canary, bridge content pins and LaunchAgents.
  *
  * Every spawn is an absolute executable with a fixed argv, no shell and a
- * bounded timeout. Nothing here runs a provider beyond `--version`, runs the
- * bws broker, or reads a secret: the broker registry is read as source text
- * and only Switchyard consumer names, paths and content pins are matched.
+ * bounded timeout. Nothing here runs a provider beyond the canary's
+ * `--version` and `--help`, runs the bws broker, or reads a secret: the
+ * broker registry is read as source text and only Switchyard consumer names,
+ * paths and content pins are matched.
  */
 
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-	accessSync,
-	constants,
 	createReadStream,
 	existsSync,
 	mkdirSync,
@@ -22,20 +21,15 @@ import {
 	rmSync,
 } from "node:fs";
 import { homedir, tmpdir, userInfo } from "node:os";
-import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { isAbsolute, join } from "node:path";
+import { runCliCanary } from "../cli-contract/canary.mjs";
 import {
 	quickCheckSandboxProfile,
 	safeEnv,
 } from "../runner/checks-sandbox.mjs";
-import {
-	parseBrokerConsumers,
-	parseCliManifest,
-	SANDBOX_TOOLS,
-} from "./checks.mjs";
+import { parseBrokerConsumers, SANDBOX_TOOLS } from "./checks.mjs";
 
 const PROBE_TIMEOUT_MS = 15_000;
-const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 /** The broker the simple lane launches (provider-invocation.mjs). */
 const BWS_BROKER = "/Users/dave/.agent/bin/bws-secret-exec";
 const CANARY_LABEL = "com.zerodelta.switchyard.sandbox-canary";
@@ -57,8 +51,6 @@ function run(file, args, options = {}) {
 		);
 	});
 }
-const spawnError = (error) =>
-	error?.killed ? "timeout" : String(error?.code ?? error?.signal ?? error);
 
 async function sha256File(path) {
 	try {
@@ -110,45 +102,24 @@ export async function probeSandboxToolchain() {
 	}
 }
 
-function onPath(name, path = process.env.PATH ?? "") {
-	for (const dir of path.split(delimiter)) {
-		if (!isAbsolute(dir)) continue;
-		try {
-			accessSync(join(dir, name), constants.X_OK);
-			return join(dir, name);
-		} catch {}
-	}
-	return null;
-}
+// Canary rows run one at a time with a 30 s bound per step; this cap keeps
+// a stalled CLI from holding doctor longer. A row cut off reports
+// `unavailable`, never drift.
+const CLI_CANARY_BUDGET_MS = 120_000;
 
-/** Manifest pins and each pinned CLI's `--version`, resolved on PATH. */
-export async function probeProviderClis({
-	manifestPath = join(REPO_ROOT, "ops/macos-vm/cli-manifest.txt"),
-} = {}) {
-	let pins;
-	try {
-		pins = parseCliManifest(readFileSync(manifestPath, "utf8"));
-	} catch {
-		return { pins: [], probes: {} };
-	}
-	const entries = await Promise.all(
-		pins.map(async ({ provider }) => {
-			const path = onPath(provider);
-			if (!path) return [provider, { path: null }];
-			const answer = await run(path, ["--version"], {
-				env: { ...process.env, NO_COLOR: "1" },
-			});
-			return [
-				provider,
-				{
-					path,
-					output: answer.output,
-					...(answer.error ? { error: spawnError(answer.error) } : {}),
-				},
-			];
-		}),
-	);
-	return { pins, probes: Object.fromEntries(entries) };
+/**
+ * The launch-admission CLI canary over every contract row: `--version` and
+ * `--help` per CLI, offline and with no credentials.
+ * @param {{onRow?: (row: object) => void, now?: () => number}} [options]
+ *   Also forwards the canary's `run` and `resolve` seams.
+ * @returns {Promise<object[]>} One canary result per contract row.
+ */
+export function probeCliContracts({ now = Date.now, ...options } = {}) {
+	return runCliCanary({
+		...options,
+		now,
+		deadlineMs: now() + CLI_CANARY_BUDGET_MS,
+	});
 }
 
 /**

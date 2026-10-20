@@ -30,7 +30,7 @@ import {
 
 const DOCTOR_USAGE = `Usage: switchyard-dispatch doctor [--quick] [--json]
 
-Read-only host diagnosis: sandbox toolchain, provider CLI versions, bridge
+Read-only host diagnosis: sandbox toolchain, provider CLI contracts, bridge
 content pins, qualification expiry, repair holds, stranded pending attempts
 the canary LaunchAgent and any leftover retired VM reaper. --quick runs only the state-file checks.
 Exit status: 0 no failures (warnings allowed), 1 a check failed, 2 usage.`;
@@ -41,11 +41,15 @@ const QUICK_PROBES = Object.freeze({
 	pending: () => readStrandedPending(),
 });
 
-async function hostProbes() {
+async function hostProbes(onProgress) {
 	const host = await import("./host.mjs");
 	return {
 		sandbox: host.probeSandboxToolchain,
-		clis: host.probeProviderClis,
+		clis: () =>
+			host.probeCliContracts({
+				onRow: (row) =>
+					onProgress?.(`switchyard doctor: checking ${row.cli}\n`),
+			}),
 		bridges: host.probeBridgePins,
 		agents: host.probeLaunchAgents,
 	};
@@ -53,18 +57,21 @@ async function hostProbes() {
 
 /**
  * Gather every probe concurrently and evaluate the checks.
- * @param {{quick?: boolean, probes?: object, now?: () => number}} [options]
- *   `probes` replaces any of the default probe functions by name.
+ * @param {{quick?: boolean, probes?: object, now?: () => number,
+ *   onProgress?: (line: string) => void}} [options]
+ *   `probes` replaces any of the default probe functions by name;
+ *   `onProgress` receives one line as the CLI canary starts each CLI.
  * @returns {Promise<{schemaVersion: 1, status: string, checks: object[]}>}
  */
 export async function runDoctor({
 	quick = false,
 	probes = {},
 	now = Date.now,
+	onProgress,
 } = {}) {
 	const all = {
 		...QUICK_PROBES,
-		...(quick ? {} : await hostProbes()),
+		...(quick ? {} : await hostProbes(onProgress)),
 		...probes,
 	};
 	const answer = (name) =>
@@ -91,7 +98,7 @@ export async function runDoctor({
 	const checks = [];
 	if (!quick) {
 		checks.push(checkSandboxToolchain(answers.sandbox));
-		checks.push(checkProviderClis(answers.clis?.pins, answers.clis?.probes));
+		checks.push(checkProviderClis(answers.clis));
 		checks.push(checkBridgePins(answers.bridges));
 	}
 	checks.push(checkQualificationExpiry(answers.qualification, nowMs));
@@ -101,7 +108,7 @@ export async function runDoctor({
 	return { schemaVersion: 1, status: overallStatus(checks), checks };
 }
 
-/** Human report: a header, one line per check, indented fix lines. */
+/** Human report: a header, one line per check, indented detail and fix lines. */
 export function formatDoctorReport(report) {
 	const count = (status) =>
 		report.checks.filter((check) => check.status === status).length;
@@ -113,6 +120,7 @@ export function formatDoctorReport(report) {
 		lines.push(
 			`${check.status.padEnd(4)}  ${check.id.padEnd(width)}  ${check.summary}`,
 		);
+		for (const detail of check.details ?? []) lines.push(`      ${detail}`);
 		for (const fix of check.fixes) lines.push(`      fix: ${fix}`);
 	}
 	return `${lines.join("\n")}\n`;
@@ -153,6 +161,7 @@ export async function handleDoctor(argv, dependencies = {}) {
 		quick: values.quick === true,
 		probes: dependencies.probes,
 		now: dependencies.now,
+		onProgress: stderr,
 	});
 	stdout(
 		values.json ? `${JSON.stringify(report)}\n` : formatDoctorReport(report),

@@ -476,14 +476,14 @@ export async function checkTargetCliContract(targetId, options = {}) {
 	return result;
 }
 
-/** Forget cached results (tests, and a future doctor that wants a fresh read). */
+/** Forget cached results (tests). */
 export function resetCliContractCache() {
 	cache.clear();
 }
 
 /**
- * Run the canary over every contract row, for `npm run cli:canary` and the
- * future `doctor`. Rows run one at a time so progress stays readable.
+ * Run the canary over every contract row, for `npm run cli:canary` and
+ * `doctor`. Rows run one at a time so progress stays readable.
  * @returns {Promise<object[]>} One frozen result per row, with its targets.
  */
 export async function runCliCanary(options = {}) {

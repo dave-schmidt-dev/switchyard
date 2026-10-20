@@ -1,7 +1,11 @@
 // @test-phase: other
 import { deepStrictEqual, match, ok, strictEqual } from "node:assert";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { describe, it } from "node:test";
+import {
+	CLI_CONTRACTS,
+	cliContractPreflightDetail,
+} from "../src/switchyard/cli-contract/canary.mjs";
 import {
 	checkBridgePins,
 	checkLaunchAgents,
@@ -11,9 +15,8 @@ import {
 	checkSandboxToolchain,
 	checkStrandedPending,
 	parseBrokerConsumers,
-	parseCliManifest,
-	parseCliVersion,
 } from "../src/switchyard/doctor/checks.mjs";
+import { probeCliContracts } from "../src/switchyard/doctor/host.mjs";
 import {
 	formatDoctorReport,
 	handleDoctor,
@@ -26,31 +29,22 @@ const SHA_A = "a".repeat(64);
 const SHA_B = "b".repeat(64);
 const SECRET_REF = "7c8a09ee-4765-4b73-bff0-b490001a142a";
 
-describe("doctor version and manifest parsing", () => {
-	it("reads the version token from every observed host CLI answer", () => {
-		for (const [text, version] of [
-			["2.1.302 (Claude Code)", "2.1.302"],
-			["codex-cli 0.163.0", "0.163.0"],
-			["1.4.2", "1.4.2"],
-			["2026.10.01-e373342", "2026.10.01-e373342"],
-			["GitHub Copilot CLI 1.0.96.\nRun 'copilot update' to check.", "1.0.96"],
-			["opencode v2.0.32", "2.0.32"],
-			["vibe 2.25.0", "2.25.0"],
-			["no version here", null],
-		])
-			strictEqual(parseCliVersion(text), version, text);
-	});
-
-	it("parses the committed CLI manifest pins", () => {
-		const pins = parseCliManifest(
-			readFileSync("ops/macos-vm/cli-manifest.txt", "utf8"),
-		);
-		deepStrictEqual(
-			pins.map((pin) => pin.provider),
-			["claude", "codex", "agy", "cursor-agent", "copilot", "opencode", "vibe"],
-		);
-		ok(pins.every((pin) => parseCliVersion(pin.version) !== null));
-	});
+/** One CLI canary result row, as `runCliCanary` returns it. */
+const canaryRow = (cli, fields = {}) => ({
+	cli,
+	binary: cli,
+	resolvedPath: `/bin/${cli}`,
+	version: "1.0.0",
+	status: "ok",
+	missingFlags: [],
+	detail: null,
+	targets: [cli],
+	...fields,
+});
+const DRIFTED_OPENCODE = canaryRow("opencode", {
+	version: "2.0.1",
+	status: "flags_missing",
+	missingFlags: ["run --variant"],
 });
 
 describe("doctor host checks", () => {
@@ -63,35 +57,111 @@ describe("doctor host checks", () => {
 		strictEqual(checkSandboxToolchain({ error: "ENOENT" }).status, "fail");
 	});
 
-	it("warns on CLI drift and fails a missing or broken CLI", () => {
-		const pins = [
-			{ provider: "codex", version: "0.159.2" },
-			{ provider: "vibe", version: "2.25.0" },
-		];
-		const vibe = { path: "/v", output: "vibe 2.25.0" };
-		strictEqual(
-			checkProviderClis(pins, {
-				codex: { path: "/c", output: "codex-cli 0.159.2" },
-				vibe,
-			}).status,
-			"ok",
-		);
-		const drift = checkProviderClis(pins, {
-			codex: { path: "/c", output: "codex-cli 0.163.0" },
-			vibe,
-		});
+	it("reports each adapter's canary result and names a drifted one", () => {
+		const passing = checkProviderClis([
+			canaryRow("codex", { version: "0.163.0" }),
+			canaryRow("vibe", { version: "2.25.0" }),
+		]);
+		strictEqual(passing.status, "ok");
+		strictEqual(passing.summary, "2 CLIs pass the launch contract");
+		deepStrictEqual(passing.details, [
+			"ok    codex 0.163.0",
+			"ok    vibe 2.25.0",
+		]);
+		deepStrictEqual(passing.fixes, []);
+		const drift = checkProviderClis([
+			canaryRow("codex", { version: "0.163.0" }),
+			DRIFTED_OPENCODE,
+		]);
 		strictEqual(drift.status, "warn");
-		match(drift.summary, /codex 0\.163\.0 \(pin 0\.159\.2\)/u);
-		match(drift.fixes[0], /sync-host-clis\.sh .*--check$/u);
-		strictEqual(checkProviderClis(pins, { vibe }).status, "fail");
+		strictEqual(drift.summary, "1/2 CLIs fail the launch contract");
+		deepStrictEqual(drift.details, [
+			"ok    codex 0.163.0",
+			"warn  opencode 2.0.1 no longer accepts run --variant",
+		]);
+		deepStrictEqual(drift.fixes, [
+			cliContractPreflightDetail(DRIFTED_OPENCODE).remedy,
+		]);
+		match(drift.fixes[0], /npm run cli:canary/u);
+	});
+
+	it("fails a missing or unreadable CLI and warns on an inconclusive one", () => {
+		for (const status of [
+			"not_installed",
+			"version_unreadable",
+			"help_unreadable",
+		])
+			strictEqual(
+				checkProviderClis([canaryRow("agy", { status, version: null })]).status,
+				"fail",
+				status,
+			);
+		const missing = checkProviderClis([
+			canaryRow("agy", { status: "not_installed", version: null }),
+		]);
+		deepStrictEqual(missing.details, ["fail  agy is not installed at agy"]);
+		const inconclusive = checkProviderClis([
+			canaryRow("codex"),
+			canaryRow("copilot", {
+				status: "unavailable",
+				version: null,
+				detail: "timeout",
+			}),
+		]);
+		strictEqual(inconclusive.status, "warn");
+		strictEqual(inconclusive.summary, "1/2 inconclusive");
 		strictEqual(
-			checkProviderClis(pins, {
-				codex: { path: "/c", output: "", error: "timeout" },
-				vibe,
-			}).status,
-			"fail",
+			inconclusive.details.at(-1),
+			"warn  copilot check inconclusive (timeout)",
 		);
-		strictEqual(checkProviderClis([], {}).status, "fail");
+		deepStrictEqual(inconclusive.fixes, [
+			"npm run cli:canary -- --only copilot",
+		]);
+		const threw = checkProviderClis({ error: "canary exploded" });
+		strictEqual(threw.status, "fail");
+		match(threw.summary, /canary exploded/u);
+		strictEqual(checkProviderClis([]).status, "fail");
+	});
+
+	it("probes every CLI contract row through the canary within its budget", async () => {
+		const seen = [];
+		const rows = await probeCliContracts({
+			resolve: () => null,
+			onRow: (row) => seen.push(row.cli),
+		});
+		deepStrictEqual(
+			seen,
+			CLI_CONTRACTS.map((row) => row.cli),
+		);
+		ok(rows.every((row) => row.status === "not_installed"));
+		// The budget bounds every canary step: 1 s left of the 120 s budget.
+		const clock = [0, 119_000];
+		const timeouts = [];
+		await probeCliContracts({
+			only: ["codex"],
+			now: () => clock.shift() ?? 119_000,
+			resolve: () => "/bin/codex",
+			run: async (_binary, _args, { timeoutMs }) => {
+				timeouts.push(timeoutMs);
+				return { text: "", status: 1, error: null };
+			},
+		});
+		deepStrictEqual(timeouts, [1_000]);
+	});
+
+	it("leaves no reference to the retired manifest version probe", async () => {
+		const host = await import("../src/switchyard/doctor/host.mjs");
+		strictEqual("probeProviderClis" in host, false);
+		const src = new URL("../src/", import.meta.url);
+		for (const name of readdirSync(src, { recursive: true }))
+			if (String(name).endsWith(".mjs"))
+				strictEqual(
+					readFileSync(new URL(String(name), src), "utf8").includes(
+						"probeProviderClis",
+					),
+					false,
+					String(name),
+				);
 	});
 
 	it("reads only Switchyard consumer pins from the broker registry source", () => {
@@ -346,10 +416,7 @@ describe("doctor state checks", () => {
 describe("doctor report and exit status", () => {
 	const healthy = {
 		sandbox: () => ({ tools: { node: "/n", npm: "/m", uv: "/u" } }),
-		clis: () => ({
-			pins: [{ provider: "vibe", version: "2.25.0" }],
-			probes: { vibe: { path: "/v", output: "vibe 2.25.0" } },
-		}),
+		clis: () => [canaryRow("vibe", { version: "2.25.0" })],
 		bridges: () => ({
 			brokerPresent: true,
 			registryPath: "/b.py",
@@ -388,8 +455,12 @@ describe("doctor report and exit status", () => {
 		);
 		const lines = io.out.join("").trimEnd().split("\n");
 		strictEqual(lines[0], "switchyard doctor: ok (7 checks: 0 fail, 0 warn)");
+		strictEqual(lines[3], "      ok    vibe 2.25.0");
 		deepStrictEqual(
-			lines.slice(1).map((line) => line.split(/\s+/u).slice(0, 2).join(" ")),
+			lines
+				.slice(1)
+				.filter((line) => !line.startsWith("      "))
+				.map((line) => line.split(/\s+/u).slice(0, 2).join(" ")),
 			[
 				"ok sandbox-toolchain",
 				"ok provider-clis",
@@ -406,10 +477,7 @@ describe("doctor report and exit status", () => {
 			await handleDoctor([], {
 				probes: {
 					...healthy,
-					clis: () => ({
-						pins: [{ provider: "vibe", version: "2.24.0" }],
-						probes: { vibe: { path: "/v", output: "vibe 2.25.0" } },
-					}),
+					clis: () => [canaryRow("vibe"), DRIFTED_OPENCODE],
 				},
 				now: () => NOW,
 				...warned,
@@ -418,7 +486,19 @@ describe("doctor report and exit status", () => {
 		);
 		match(
 			warned.out.join(""),
-			/^warn {2}provider-clis .*\n {6}fix: ops\/macos-vm/mu,
+			/^warn {2}provider-clis +1\/2 CLIs fail the launch contract\n {6}ok {4}vibe 1\.0\.0\n {6}warn {2}opencode 2\.0\.1 no longer accepts run --variant\n {6}fix: port the adapter /mu,
+		);
+		const missing = capture();
+		strictEqual(
+			await handleDoctor([], {
+				probes: {
+					...healthy,
+					clis: () => [canaryRow("vibe", { status: "not_installed" })],
+				},
+				now: () => NOW,
+				...missing,
+			}),
+			1,
 		);
 		const failed = capture();
 		strictEqual(

@@ -9,9 +9,12 @@
  * Status rule: `fail` means a probe could not run or a pinned identity is
  * broken (a sandbox tool, a provider CLI, a bridge or runtime hash, unreadable
  * state). `warn` means one route is, or soon will be, unavailable until the
- * owner acts (qualification expiry, a repair hold, a stranded attempt, CLI
- * drift, a LaunchAgent that is missing or stale).
+ * owner acts (qualification expiry, a repair hold, a stranded attempt, a CLI
+ * that dropped a flag its lane passes, a LaunchAgent that is missing or
+ * stale).
  */
+
+import { cliContractPreflightDetail } from "../cli-contract/canary.mjs";
 
 export const STATUS = Object.freeze({ OK: "ok", WARN: "warn", FAIL: "fail" });
 const RANK = { ok: 0, warn: 1, fail: 2 };
@@ -73,72 +76,80 @@ export function checkSandboxToolchain(probe) {
 }
 
 /**
- * The first version-shaped token of a `--version` answer, without a leading
- * `v` or trailing punctuation: "opencode v2.0.32" -> "2.0.32".
- * @param {string} text
- * @returns {string|null}
+ * Doctor severity for each canary status. A dropped flag or an inconclusive
+ * run leaves the CLI's routes unavailable until the owner acts; a CLI that is
+ * missing or cannot answer `--version` or `--help` is a failed probe.
  */
-export function parseCliVersion(text) {
-	for (const token of String(text ?? "").split(/\s+/u)) {
-		const match = token.match(/^v?(\d+(?:\.\d+)+(?:-[0-9a-z]+)?)/iu);
-		if (match) return match[1];
-	}
-	return null;
+const CANARY_SEVERITY = Object.freeze({
+	ok: STATUS.OK,
+	flags_missing: STATUS.WARN,
+	unavailable: STATUS.WARN,
+	not_installed: STATUS.FAIL,
+	version_unreadable: STATUS.FAIL,
+	help_unreadable: STATUS.FAIL,
+});
+
+function canaryLine(row) {
+	const severity = CANARY_SEVERITY[row.status] ?? STATUS.FAIL;
+	const reason =
+		row.status === "ok"
+			? `${row.cli} ${row.version}`
+			: row.status === "unavailable"
+				? `${row.cli} check inconclusive (${row.detail ?? "unknown"})`
+				: cliContractPreflightDetail(row).condition;
+	return { severity, line: `${severity.padEnd(4)}  ${reason}` };
 }
 
 /**
- * Parse `ops/macos-vm/cli-manifest.txt`: `provider|kind|ref|detail|sha256|version`.
- * @param {string} text
- * @returns {{provider: string, version: string}[]}
+ * Each adapter's CLI against its launch contract, from the CLI canary
+ * (`runCliCanary`, the check behind `npm run cli:canary` and launch
+ * admission). `details` holds one line per adapter.
+ * @param {object[]|{error: string}} rows - The canary's per-row results.
  */
-export function parseCliManifest(text) {
-	return String(text)
-		.split("\n")
-		.map((line) => line.trim())
-		.filter((line) => line && !line.startsWith("#"))
-		.map((line) => line.split("|"))
-		.filter((fields) => fields.length >= 6 && fields[0] && fields[5])
-		.map((fields) => ({ provider: fields[0], version: fields[5] }));
-}
-
-/**
- * Each pinned provider CLI's `--version` against the manifest pin.
- * @param {{provider: string, version: string}[]} pins
- * @param {Record<string, {path?: string|null, output?: string, error?: string}>} probes
- */
-export function checkProviderClis(pins, probes) {
+export function checkProviderClis(rows) {
 	const id = "provider-clis";
-	if (!Array.isArray(pins) || pins.length === 0)
-		return result(id, STATUS.FAIL, "CLI manifest unreadable");
-	const missing = [];
-	const drift = [];
-	for (const pin of pins) {
-		const probe = probes?.[pin.provider];
-		const version = probe?.path ? parseCliVersion(probe.output) : null;
-		if (!probe?.path) missing.push(`${pin.provider} not on PATH`);
-		else if (probe.error || !version)
-			missing.push(
-				`${pin.provider} --version failed (${probe.error ?? "no version"})`,
-			);
-		else if (version !== pin.version)
-			drift.push(`${pin.provider} ${version} (pin ${pin.version})`);
-	}
-	const fixes =
-		drift.length > 0
-			? [
-					"ops/macos-vm/sync-host-clis.sh --cli-manifest ops/macos-vm/cli-manifest.txt --check",
-				]
-			: [];
-	if (missing.length > 0)
-		return result(id, STATUS.FAIL, [...missing, ...drift].join("; "), fixes);
-	if (drift.length > 0)
+	if (!Array.isArray(rows))
 		return result(
 			id,
-			STATUS.WARN,
-			`${drift.length}/${pins.length} differ from the manifest: ${drift.join(", ")}`,
-			fixes,
+			STATUS.FAIL,
+			`CLI canary did not run (${rows?.error ?? "no result"})`,
+			["npm run cli:canary"],
 		);
-	return result(id, STATUS.OK, `${pins.length} CLIs match the manifest`);
+	if (rows.length === 0)
+		return result(id, STATUS.FAIL, "CLI canary checked no adapters");
+	const lines = rows.map(canaryLine);
+	const status = worst(lines.map((entry) => entry.severity));
+	const failing = rows.filter(
+		(row) => row.status !== "ok" && row.status !== "unavailable",
+	);
+	const inconclusive = rows.filter((row) => row.status === "unavailable");
+	const fixes = [
+		...(failing.length > 0
+			? [cliContractPreflightDetail(failing[0]).remedy]
+			: []),
+		...(inconclusive.length > 0
+			? [
+					`npm run cli:canary -- --only ${inconclusive.map((row) => row.cli).join(",")}`,
+				]
+			: []),
+	];
+	const summary =
+		status === STATUS.OK
+			? `${rows.length} CLIs pass the launch contract`
+			: [
+					failing.length > 0
+						? `${failing.length}/${rows.length} CLIs fail the launch contract`
+						: null,
+					inconclusive.length > 0
+						? `${inconclusive.length}/${rows.length} inconclusive`
+						: null,
+				]
+					.filter(Boolean)
+					.join("; ");
+	return {
+		...result(id, status, summary, fixes),
+		details: lines.map((entry) => entry.line),
+	};
 }
 
 const CONSUMER =
