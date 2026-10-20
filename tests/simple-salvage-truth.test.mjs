@@ -46,7 +46,7 @@ function fixture() {
 
 // The provider leaves an undeclared manifest, so the diff is refused and the
 // checkout would be retained; `afterCapture` runs once the diff is captured.
-async function runRefusedDiff(afterCapture) {
+async function runRefusedDiff(afterCapture, { edit = true, ...extra } = {}) {
 	const repo = fixture();
 	const milestones = [];
 	let worktreePath;
@@ -78,11 +78,14 @@ async function runRefusedDiff(afterCapture) {
 			},
 			executeProvider: async (context) => {
 				worktreePath = context.worktreePath;
-				writeFileSync(join(worktreePath, "a.txt"), "candidate\n");
-				writeFileSync(join(worktreePath, "extra.sh"), "extra\n");
+				if (edit) {
+					writeFileSync(join(worktreePath, "a.txt"), "candidate\n");
+					writeFileSync(join(worktreePath, "extra.sh"), "extra\n");
+				}
 				return { success: true, writerLifecycle: "stopped" };
 			},
 			onVerifiedDiff: () => afterCapture?.(worktreePath),
+			...extra,
 		},
 	);
 	return { result, milestones, worktreePath };
@@ -136,6 +139,30 @@ test("a checkout whose worktree alone vanished is lost and its root removed", as
 	strictEqual(record.worktree.state, "removed");
 	strictEqual(record.worktree.reason, "worktree_missing");
 	strictEqual(existsSync(root), false, "the leftover root is cleaned up");
+});
+
+test("a root that vanishes during a failed cleanup is recorded removed, not retained", async () => {
+	let deletedRoot;
+	const { result } = await runRefusedDiff(undefined, {
+		edit: false,
+		// The guarded cleanup loses the root yet reports a rejection, so the
+		// one cleanup attempt is spent before the terminal backstop runs.
+		cleanupSimpleWorktree: async (_id, claim) => {
+			deletedRoot = claim.path;
+			rmSync(claim.path, { recursive: true, force: true });
+			return { removed: false, reason: "synthetic_cleanup_rejection" };
+		},
+	});
+	strictEqual(result.status, "failed");
+	strictEqual(result.failureReason, "empty_diff");
+	strictEqual(existsSync(deletedRoot), false);
+	strictEqual(result.partialWorktree, null);
+	strictEqual(result.partialWorktreeLoss, "worktree_missing");
+	strictEqual(result.recovery.cleanup.worktree.state, "removed");
+	const record = await readRun(result.runId);
+	strictEqual(record.worktree.state, "removed");
+	strictEqual(record.worktree.reason, "worktree_missing");
+	strictEqual(record.worktree.retainedAt, null);
 });
 
 test("only a proven-missing root or materialized worktree counts as lost", () => {

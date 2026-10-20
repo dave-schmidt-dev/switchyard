@@ -387,13 +387,15 @@ export async function runSimpleTask(options, dependencies = {}) {
 	};
 	let cleanupAttempted = false;
 	const removeNonSalvageWorktree = async () => {
-		if (cleanupAttempted || !worktreeRoot) return !worktreeRoot;
+		if (!worktreeRoot) return true;
+		// Checked before the one-attempt guard: a root lost during a failed
+		// cleanup is gone too, so nothing remains to remove or retain.
 		if (worktreeVanished && simpleRootMissing(worktreeRoot)) {
-			// Nothing remains to remove or retain; an outside deletion owns it.
 			worktreePath = null;
 			worktreeRoot = null;
 			return true;
 		}
+		if (cleanupAttempted) return false;
 		cleanupAttempted = true;
 		try {
 			// Injected provider/check tests normally use the direct cleanup seam;
