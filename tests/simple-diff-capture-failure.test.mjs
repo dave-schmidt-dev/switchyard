@@ -260,3 +260,91 @@ test("a diff capture stopped by the run deadline carries deadline_expired in the
 	strictEqual(record.causeCategory, "environment");
 	strictEqual(record.failureReason, "deadline_expired");
 });
+
+// The provider succeeds, but the run's deadline has passed by the time it
+// returns, so the run stops before diff capture and before any check.
+test("a deadline that passes after the provider succeeds carries deadline_expired, not a check timeout", async () => {
+	const repo = fixture();
+	let clock = 1_000;
+	let checked = false;
+	const result = await runSimpleTask(
+		{
+			...repo,
+			capability: "standard",
+			files: ["a.txt"],
+			checks: ["test -f a.txt"],
+			deadlineMs: 10_000,
+		},
+		{
+			tmpdir: repo.root,
+			now: () => clock,
+			route: () => ({ provider: "Codex (Spark)", reason: "priority_fill" }),
+			resolveTargetIdentity: () => ({
+				targetId: "codex",
+				harnessKey: "codex",
+				ambiguous: false,
+			}),
+			getInvocationDescriptor: () => ({
+				target_id: "codex",
+				selector: "gpt-5.3-codex-spark",
+				invocation_args: [],
+			}),
+			assertFundedRoute: () => {},
+			executeProvider: async ({ worktreePath }) => {
+				writeFileSync(join(worktreePath, "a.txt"), "late candidate\n");
+				clock = 12_000;
+				return { success: true, writerLifecycle: "stopped" };
+			},
+			runCheck: async () => {
+				checked = true;
+				return { success: true, exitCode: 0 };
+			},
+		},
+	);
+	strictEqual(checked, false);
+	strictEqual(result.status, "failed");
+	strictEqual(result.failurePhase, "diff");
+	strictEqual(result.failureReason, "deadline_expired");
+	strictEqual(result.errorKind, "environment_failure");
+	strictEqual(result.providerReliability.causeCode, "deadline_expired");
+	strictEqual(result.providerReliability.causeCategory, "environment");
+
+	const run = await readRun(result.runId);
+	strictEqual(run.failureDetails.failureReason, "deadline_expired");
+	strictEqual(run.lastFailure.errorKind, "environment_failure");
+	strictEqual(run.lastFailure.reasonCode, "environment_failure");
+	strictEqual(
+		run.lastFailure.providerReliability.causeCode,
+		"deadline_expired",
+	);
+	strictEqual(run.lastFailure.providerReliability.causeCategory, "environment");
+
+	const stateRoot = tempDir("switchyard-late-provider-deadline-log-");
+	const classification = classifyAttemptFailure({
+		result,
+		accountability: result.accountability,
+	});
+	strictEqual(classification.reason, "environment_failure");
+	appendFailureRecord(
+		failureAttemptRecord({
+			project: "/review/project",
+			routingRunId: "routing-3",
+			attempt: {
+				taskId: result.taskId,
+				attemptId: result.attemptId,
+				runId: result.runId,
+				targetId: "codex",
+				capability: "standard",
+			},
+			result,
+			accountability: result.accountability,
+			classification,
+		}),
+		{ stateRoot },
+	);
+	const [record] = readFailureRecords({ stateRoot });
+	strictEqual(record.reason, "environment_failure");
+	strictEqual(record.causeCode, "deadline_expired");
+	strictEqual(record.causeCategory, "environment");
+	strictEqual(record.failureReason, "deadline_expired");
+});

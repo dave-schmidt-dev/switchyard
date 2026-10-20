@@ -230,7 +230,9 @@ describe("deadline retained worktree changed files", () => {
 		retain(result, repo.projectPath);
 		strictEqual(result.status, "failed");
 		strictEqual(result.failureReason, "deadline_expired");
-		strictEqual(result.failurePhase, "checks");
+		// No check started, so this is not a check timeout.
+		strictEqual(result.failurePhase, "diff");
+		strictEqual(result.providerReliability.causeCode, "deadline_expired");
 		ok(result.partialWorktree, "partialWorktree must be set");
 		deepStrictEqual(result.changedFiles, ["src/a.txt"]);
 	});

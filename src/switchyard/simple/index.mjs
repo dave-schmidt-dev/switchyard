@@ -1755,7 +1755,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 			});
 			changedFiles = deadlineCapture.files;
 			changedFilesUnavailable = deadlineCapture.available !== true;
-			return fail("deadline_expired", "checks");
+			// The provider succeeded and no check has started: the deadline ran
+			// out before diff capture, so it is not a check timeout.
+			return fail("deadline_expired", "diff");
 		}
 		currentPhase = "diff";
 		milestone("diff", "capture_started");
