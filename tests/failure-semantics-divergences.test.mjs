@@ -17,7 +17,7 @@ const fixture = JSON.parse(
 	),
 );
 
-test("quota consumers retain their distinct legacy evidence gates pending FAIL-2", () => {
+test("quota effects require matching authoritative adapter evidence", () => {
 	for (const row of fixture.quota) {
 		const providerReliability = diagnostic({
 			causeCode: "quota_exhausted",
@@ -26,15 +26,15 @@ test("quota consumers retain their distinct legacy evidence gates pending FAIL-2
 		const input = {
 			status: "failed",
 			providerReliability,
-			diagnosticCode: "quota_exhausted",
+			diagnosticCode: row.diagnosticCode ?? "quota_exhausted",
 			diagnosticOrigin: row.origin ?? undefined,
 			diagnosticEvidenceAvailable: row.evidenceAvailable,
-			failurePhase: "provider_execution",
+			failurePhase: row.failurePhase ?? "provider_execution",
 		};
 		deepStrictEqual(
 			{
-				marker: semantics.shouldRecordRouteExhaustion(input),
-				nonBlamingCause: semantics.nonBlamingCause(input),
+				marker: semantics.shouldRecordRouteExhaustion(input, input),
+				nonBlamingCause: semantics.nonBlamingCause(input, input),
 				owner: semantics.deriveFailureAccountability({
 					providerReliability,
 					provenance: input,
@@ -50,7 +50,7 @@ test("quota consumers retain their distinct legacy evidence gates pending FAIL-2
 	}
 });
 
-test("task exclusion and ownership retain their distinct legacy rules pending FAIL-3", () => {
+test("task exclusion and ownership retain separate failure owners", () => {
 	for (const row of fixture.blame) {
 		const providerReliability = diagnostic({
 			causeCode: row.causeCode,

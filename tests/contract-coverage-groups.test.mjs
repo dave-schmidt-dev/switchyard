@@ -154,6 +154,7 @@ describe("contract coverage groups", () => {
 			"tests/simple-process-teardown-clock.test.mjs",
 			"tests/simple-progress.test.mjs",
 			"tests/simple-provider-launch-evidence.test.mjs",
+			"tests/simple-quota-producer-trust.test.mjs",
 			"tests/simple-report-citations.test.mjs",
 			"tests/simple-report-mode.test.mjs",
 			"tests/simple-undeclared-scope.test.mjs",

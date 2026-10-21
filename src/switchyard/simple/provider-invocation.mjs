@@ -386,6 +386,10 @@ export async function defaultExecuteProvider(context) {
 		context.targetId,
 		context.capability,
 	);
+	const fixedOpenCodeGoBridgeInvocation =
+		context.harness === "opencode" &&
+		invocation.command === KEYLESS_BRIDGE_BROKER &&
+		invocation.args[0] === "switchyard-simple-opencode-go-dispatch";
 	const raw = await runSimpleWriter(invocation.command, invocation.args, {
 		input: context.prompt,
 		cwd: context.worktreePath,
@@ -399,6 +403,11 @@ export async function defaultExecuteProvider(context) {
 		onStderrChunk: context.onStderrChunk,
 		onProviderLaunch: context.onProviderLaunch,
 		signal: context.signal,
+		// This fixed bridge buffers child output until it exits, then emits the
+		// parent receipt; early matching would invalidate its closed lifecycle.
+		...(fixedOpenCodeGoBridgeInvocation
+			? { detectRateLimit: () => false }
+			: {}),
 		...(context.spawnFn ? { spawnFn: context.spawnFn } : {}),
 	});
 	const result = withCancelSource(raw, context.signal);
@@ -436,6 +445,10 @@ export async function defaultExecuteProvider(context) {
 		(context.harness === "vibe" && !result.success
 			? providerCodeForVibeBudgetEvidence(result.stderr)
 			: null);
+	const trustedBridgeQuotaEvidence =
+		fixedOpenCodeGoBridgeInvocation &&
+		!result.success &&
+		bridgeDiagnosticCode === "quota_exhausted";
 	const diagnosticCode = earlyRateLimited
 		? "quota_exhausted"
 		: bridgeDiagnosticCode
@@ -446,7 +459,8 @@ export async function defaultExecuteProvider(context) {
 				...result,
 				diagnosticCode,
 				diagnosticOrigin: "adapter",
-				diagnosticEvidenceAvailable: true,
+				diagnosticEvidenceAvailable:
+					diagnosticCode !== "quota_exhausted" || trustedBridgeQuotaEvidence,
 			}
 		: result;
 	if (!result.success) {

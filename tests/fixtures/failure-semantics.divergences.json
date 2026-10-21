@@ -3,12 +3,12 @@
 	"quota": [
 		{
 			"id": "quota-absent-false",
-			"ownerDecision": "pending FAIL-2: common evidence gate and TTL",
+			"ownerDecision": "unverified quota is task-local only",
 			"origin": null,
 			"evidenceAvailable": false,
 			"expected": {
-				"marker": true,
-				"nonBlamingCause": "quota_exhausted",
+				"marker": false,
+				"nonBlamingCause": null,
 				"owner": "unknown",
 				"cooldown": null,
 				"invocationCause": "provider_exit_nonzero"
@@ -16,12 +16,12 @@
 		},
 		{
 			"id": "quota-adapter-false",
-			"ownerDecision": "pending FAIL-2: common evidence gate and TTL",
+			"ownerDecision": "unverified quota is task-local only",
 			"origin": "adapter",
 			"evidenceAvailable": false,
 			"expected": {
-				"marker": true,
-				"nonBlamingCause": "quota_exhausted",
+				"marker": false,
+				"nonBlamingCause": null,
 				"owner": "unknown",
 				"cooldown": null,
 				"invocationCause": "quota_exhausted"
@@ -29,12 +29,12 @@
 		},
 		{
 			"id": "quota-launcher-false",
-			"ownerDecision": "pending FAIL-2: common evidence gate and TTL",
+			"ownerDecision": "unverified quota is task-local only",
 			"origin": "launcher",
 			"evidenceAvailable": false,
 			"expected": {
-				"marker": true,
-				"nonBlamingCause": "quota_exhausted",
+				"marker": false,
+				"nonBlamingCause": null,
 				"owner": "unknown",
 				"cooldown": null,
 				"invocationCause": "quota_exhausted"
@@ -42,12 +42,12 @@
 		},
 		{
 			"id": "quota-launcher-true",
-			"ownerDecision": "pending FAIL-2: common evidence gate and TTL",
+			"ownerDecision": "unverified quota is task-local only",
 			"origin": "launcher",
 			"evidenceAvailable": true,
 			"expected": {
-				"marker": true,
-				"nonBlamingCause": "quota_exhausted",
+				"marker": false,
+				"nonBlamingCause": null,
 				"owner": "unknown",
 				"cooldown": null,
 				"invocationCause": "quota_exhausted"
@@ -55,7 +55,7 @@
 		},
 		{
 			"id": "quota-adapter-true",
-			"ownerDecision": "pending FAIL-2: common evidence gate and TTL",
+			"ownerDecision": "trusted adapter quota permits shared suppression",
 			"origin": "adapter",
 			"evidenceAvailable": true,
 			"expected": {
@@ -65,12 +65,40 @@
 				"cooldown": "quota_exhausted",
 				"invocationCause": "quota_exhausted"
 			}
+		},
+		{
+			"id": "quota-adapter-mismatched-code",
+			"ownerDecision": "mismatched adapter evidence is rejected",
+			"origin": "adapter",
+			"evidenceAvailable": true,
+			"diagnosticCode": "provider_exit_nonzero",
+			"expected": {
+				"marker": false,
+				"nonBlamingCause": null,
+				"owner": "unknown",
+				"cooldown": null,
+				"invocationCause": "provider_exit_nonzero"
+			}
+		},
+		{
+			"id": "quota-adapter-mismatched-phase",
+			"ownerDecision": "mismatched phase is rejected",
+			"origin": "adapter",
+			"evidenceAvailable": true,
+			"failurePhase": "provider_cleanup",
+			"expected": {
+				"marker": false,
+				"nonBlamingCause": null,
+				"owner": "unknown",
+				"cooldown": null,
+				"invocationCause": "quota_exhausted"
+			}
 		}
 	],
 	"blame": [
 		{
 			"causeCode": "acceptance_check_failed",
-			"ownerDecision": "pending FAIL-3: one blame policy",
+			"ownerDecision": "task-local check failure; no provider blame",
 			"expected": {
 				"reason": "check_failed",
 				"owner": "check_system",
@@ -80,7 +108,7 @@
 		},
 		{
 			"causeCode": "scope_rejected",
-			"ownerDecision": "pending FAIL-3: one blame policy",
+			"ownerDecision": "task-local policy failure; no provider blame",
 			"expected": {
 				"reason": "policy_rejected",
 				"owner": "contract",
@@ -90,7 +118,7 @@
 		},
 		{
 			"causeCode": "environment_failure",
-			"ownerDecision": "pending FAIL-3: one blame policy",
+			"ownerDecision": "environment failure remains task-exempt",
 			"expected": {
 				"reason": "environment_failure",
 				"owner": "environment",
@@ -100,7 +128,7 @@
 		},
 		{
 			"causeCode": "provider_deadline_exceeded",
-			"ownerDecision": "pending FAIL-3: one blame policy",
+			"ownerDecision": "trusted deadline attribution preserved",
 			"expected": {
 				"reason": "execution_failed",
 				"owner": "provider",
@@ -110,7 +138,7 @@
 		},
 		{
 			"causeCode": "provider_exit_nonzero",
-			"ownerDecision": "pending FAIL-3: one blame policy",
+			"ownerDecision": "unknown failure remains task-local",
 			"expected": {
 				"reason": "execution_failed",
 				"owner": "unknown",

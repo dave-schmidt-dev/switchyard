@@ -8,6 +8,10 @@ import {
 	TASK_EXCLUSION_EXEMPT_REASONS,
 } from "../src/switchyard/simple/attempt-blame.mjs";
 import {
+	liveRouteExhaustion,
+	ROUTE_EXHAUSTION_TTL_MS,
+} from "../src/switchyard/simple/route-exhaustion.mjs";
+import {
 	MAX_SOFT_ATTEMPTS_PER_TASK,
 	runSimpleRoutingTask,
 } from "../src/switchyard/simple/routing-run.mjs";
@@ -322,7 +326,28 @@ test("attempt-blame marks only caller cancellations and live quota non-blaming",
 		nonBlamingCause({
 			providerReliability: { causeCode: "quota_exhausted" },
 		}),
+		null,
+	);
+	const quotaEvidence = {
+		diagnosticCode: "quota_exhausted",
+		diagnosticOrigin: "adapter",
+		diagnosticEvidenceAvailable: true,
+		failurePhase: "provider_execution",
+	};
+	const quotaReliability = createProviderReliabilityDiagnostic({
+		causeCode: "quota_exhausted",
+		phase: "provider",
+	});
+	strictEqual(
+		nonBlamingCause({ providerReliability: quotaReliability }, quotaEvidence),
 		"quota_exhausted",
+	);
+	strictEqual(
+		nonBlamingCause(
+			{ providerReliability: quotaReliability },
+			{ ...quotaEvidence, diagnosticOrigin: "launcher" },
+		),
+		null,
 	);
 	strictEqual(nonBlamingCause({}), null);
 });
@@ -399,13 +424,22 @@ test("(i) internal-deadline cancellation still excludes the target for the task"
 
 // (j) Quota failures exhaust capacity, not the task: no target failed it.
 test("(j) quota-only exhaustion reports capacity, not task failures", async () => {
+	const providerReliability = createProviderReliabilityDiagnostic({
+		causeCode: "quota_exhausted",
+		phase: "provider",
+	});
 	const quotaFailure = {
 		status: "failed",
-		result: {
-			providerReliability: createProviderReliabilityDiagnostic({
-				causeCode: "quota_exhausted",
-				phase: "provider",
-			}),
+		result: { providerReliability },
+		record: {
+			lastFailure: {
+				errorKind: "execution_failed",
+				providerReliability,
+				diagnosticCode: "quota_exhausted",
+				diagnosticOrigin: "adapter",
+				diagnosticEvidenceAvailable: true,
+				failurePhase: "provider_execution",
+			},
 		},
 	};
 	const f = fixture({
@@ -414,6 +448,9 @@ test("(j) quota-only exhaustion reports capacity, not task failures", async () =
 		codex: quotaFailure,
 		vibe: quotaFailure,
 	});
+	const markerClock = Date.now();
+	f.deps.now = () => markerClock;
+	f.options.deadlineMs = markerClock + 60_000;
 	const result = await runSimpleRoutingTask(f.options, f.deps);
 	strictEqual(result.direction, "native_required");
 	strictEqual(result.exhaustionCause, "capacity");
@@ -424,6 +461,97 @@ test("(j) quota-only exhaustion reports capacity, not task failures", async () =
 		),
 		true,
 	);
+	const marker = liveRouteExhaustion({
+		stateRoot: f.deps.stateRoot,
+		now: () => markerClock,
+	});
+	strictEqual(marker.length, 3);
+	for (const entry of marker)
+		strictEqual(entry.until, markerClock + ROUTE_EXHAUSTION_TTL_MS);
+});
+
+test("unverified quota evidence stays task-local without shared effects", async () => {
+	const providerReliability = createProviderReliabilityDiagnostic({
+		causeCode: "quota_exhausted",
+		phase: "provider",
+	});
+	const untrustedEvidence = [
+		["missing", {}],
+		[
+			"adapter-false",
+			{
+				diagnosticCode: "quota_exhausted",
+				diagnosticOrigin: "adapter",
+				diagnosticEvidenceAvailable: false,
+				failurePhase: "provider_execution",
+			},
+		],
+		[
+			"launcher",
+			{
+				diagnosticCode: "quota_exhausted",
+				diagnosticOrigin: "launcher",
+				diagnosticEvidenceAvailable: true,
+				failurePhase: "provider_execution",
+			},
+		],
+		[
+			"adapter-code-mismatch",
+			{
+				diagnosticCode: "provider_exit_nonzero",
+				diagnosticOrigin: "adapter",
+				diagnosticEvidenceAvailable: true,
+				failurePhase: "provider_execution",
+			},
+		],
+		[
+			"adapter-phase-mismatch",
+			{
+				diagnosticCode: "quota_exhausted",
+				diagnosticOrigin: "adapter",
+				diagnosticEvidenceAvailable: true,
+				failurePhase: "provider_cleanup",
+			},
+		],
+	];
+	for (const [id, evidence] of untrustedEvidence) {
+		const unverifiedQuota = {
+			status: "failed",
+			result: { providerReliability },
+			record: {
+				lastFailure: {
+					errorKind: "execution_failed",
+					providerReliability,
+					...evidence,
+				},
+			},
+		};
+		const f = fixture({ __targets: ["codex"], codex: unverifiedQuota });
+		f.options.taskId = `unverified-quota-${id}`;
+		f.options.onlyProviders = ["codex"];
+		const first = await runSimpleRoutingTask(f.options, f.deps);
+		strictEqual(first.attempts[0]?.terminal, "skipped", id);
+		strictEqual(first.attempts[0]?.nonBlamingCause, undefined, id);
+		deepStrictEqual(first.failedTargetIds, [], id);
+		deepStrictEqual(
+			liveRouteExhaustion({ stateRoot: f.deps.stateRoot }),
+			[],
+			id,
+		);
+		const sameTask = await runSimpleRoutingTask(f.options, f.deps);
+		strictEqual(sameTask.stopReason, "pinned_target_failed", id);
+		deepStrictEqual(f.calls, ["codex"], id);
+		f.options.taskId = `different-${id}`;
+		await runSimpleRoutingTask(f.options, f.deps);
+		deepStrictEqual(f.calls, ["codex", "codex"], id);
+		deepStrictEqual(
+			readRoutingRunState(f.options.projectPath, "run-1", {
+				stateRoot: f.deps.stateRoot,
+			}).failedTargetIds,
+			[],
+			id,
+		);
+	}
 });
 
 // (k) One ordinary soft failure still makes the exhaustion a task failure.

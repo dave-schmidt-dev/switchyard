@@ -332,6 +332,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 				postProviderDependencyRefusal,
 				classification,
 				reason,
+				matchedProvenance,
 				nonBlaming,
 			} = evaluated;
 
@@ -405,7 +406,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 			}
 			// A live quota error exhausts the target's route eligibility for
 			// an hour; the durable marker outlives this run's Gradus snapshot.
-			if (shouldRecordRouteExhaustion(result)) {
+			if (shouldRecordRouteExhaustion(result, matchedProvenance)) {
 				try {
 					recordRouteExhaustion(pending.targetId, {
 						stateRoot: deps.stateRoot,

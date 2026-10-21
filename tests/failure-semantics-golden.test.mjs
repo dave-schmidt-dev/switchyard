@@ -17,5 +17,21 @@ test("failure decisions reproduce the pre-consolidation golden table", () => {
 			),
 		).toString("utf8"),
 	);
-	deepStrictEqual(failureSemanticsTable({ ...semantics, ...disk }), expected);
+	// Quota trust is the approved divergence. Keep the frozen table's old
+	// cause-only projection here; strict quota behavior has focused tests.
+	const historicalSemantics = {
+		...semantics,
+		...disk,
+		shouldRecordRouteExhaustion(result) {
+			if (result?.providerReliability?.causeCode === "quota_exhausted")
+				return true;
+			return semantics.shouldRecordRouteExhaustion(result);
+		},
+		nonBlamingCause(result) {
+			if (result?.providerReliability?.causeCode === "quota_exhausted")
+				return "quota_exhausted";
+			return semantics.nonBlamingCause(result);
+		},
+	};
+	deepStrictEqual(failureSemanticsTable(historicalSemantics), expected);
 });

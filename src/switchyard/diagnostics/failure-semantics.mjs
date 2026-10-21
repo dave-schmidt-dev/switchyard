@@ -375,16 +375,23 @@ export const TASK_EXCLUSION_EXEMPT_REASONS = new Set([
 	"lifecycle_recovered",
 ]);
 
-/** Caller signal cancellations and quota limits do not prove a target defect. */
+/** Caller signals and authoritative quota evidence do not prove a target defect. */
 export const NON_BLAMING_CAUSES = Object.freeze([
 	"caller_cancelled",
 	"quota_exhausted",
 ]);
 
-/** Quota limits and SIGTERM/SIGINT do not blame the target; internal-deadline and unspecified cancellations retain blame. */
-export function nonBlamingCause(result) {
+/** Authoritative quota evidence and caller signals do not blame the target; internal-deadline and unspecified cancellations retain blame. */
+export function nonBlamingCause(result, provenance = null) {
 	const reliability = result?.providerReliability;
-	if (reliability?.causeCode === "quota_exhausted") return "quota_exhausted";
+	if (
+		reliability?.causeCode === "quota_exhausted" &&
+		confirmedProviderCooldownCode({
+			...(provenance ?? {}),
+			providerReliability: reliability,
+		}) === "quota_exhausted"
+	)
+		return "quota_exhausted";
 	if (reliability?.causeCode !== "cancelled") return null;
 	const source = reliability.cancelSource ?? result.cancelSource;
 	return source === "signal_sigterm" || source === "signal_sigint"
@@ -392,7 +399,7 @@ export function nonBlamingCause(result) {
 		: null;
 }
 
-/** Exclude targets only for this task; baseline, environment, recovery, caller-signal cancellation and quota causes stay eligible. */
+/** Exclude targets only for this task; baseline, environment, recovery, caller-signal cancellation and trusted quota causes stay eligible. */
 export function taskExcludedTargets(attempts, logicalTaskId) {
 	const excluded = new Set();
 	for (const attempt of attempts) {
@@ -587,11 +594,11 @@ export function isTargetFailure(entry, source) {
 	);
 }
 
-/** Preserve the marker writer's existing cause-only quota gate. */
-export function shouldRecordRouteExhaustion(result) {
+/** Only matched authoritative adapter quota evidence writes shared suppression. */
+export function shouldRecordRouteExhaustion(result, provenance = null) {
 	return (
-		result.status !== "succeeded" &&
-		result.providerReliability?.causeCode === "quota_exhausted"
+		result?.status !== "succeeded" &&
+		nonBlamingCause(result, provenance) === "quota_exhausted"
 	);
 }
 

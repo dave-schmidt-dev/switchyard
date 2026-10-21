@@ -179,11 +179,12 @@ export async function evaluateAttempt({
 		result.providerReliability,
 		record.lastFailure?.providerReliability,
 	);
+	const matchedProvenance = diagnosticMatches ? record.lastFailure : null;
 	const accountability = deriveFailureAccountability({
 		providerReliability: diagnosticMatches
 			? record.lastFailure?.providerReliability
 			: undefined,
-		provenance: record.lastFailure,
+		provenance: matchedProvenance ?? {},
 	});
 	if (typed) result.accountability = accountability;
 	// A baseline failure precedes the provider and is not evidence against the target.
@@ -218,9 +219,10 @@ export async function evaluateAttempt({
 		postProviderDependencyRefusal,
 		classification,
 		reason: failed ? classification.reason : "succeeded",
-		// A caller cancellation or live quota error is not the target's fault;
+		matchedProvenance,
+		// Caller cancellation or trusted quota evidence is not the target's fault;
 		// recording it keeps the target eligible for later attempts at this task.
-		nonBlaming: failed ? nonBlamingCause(result) : null,
+		nonBlaming: failed ? nonBlamingCause(result, matchedProvenance) : null,
 	};
 }
 

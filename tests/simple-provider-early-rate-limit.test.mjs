@@ -107,7 +107,7 @@ test("streaming matcher bounds the tail and ignores the echoed prompt", () => {
 	strictEqual(plain.push("stdout", "upstream_status=429\n"), true);
 });
 
-test("a stderr rate-limit report stops the provider early and resolves quota_exhausted", async () => {
+test("a stderr rate-limit report stops early without trusted quota evidence", async () => {
 	const children = [];
 	try {
 		const startedAt = Date.now();
@@ -131,7 +131,7 @@ test("a stderr rate-limit report stops the provider early and resolves quota_exh
 		strictEqual(result.terminationReason, "rate_limited");
 		strictEqual(result.diagnosticCode, "quota_exhausted");
 		strictEqual(result.diagnosticOrigin, "adapter");
-		strictEqual(result.diagnosticEvidenceAvailable, true);
+		strictEqual(result.diagnosticEvidenceAvailable, false);
 		strictEqual(result.providerSignature, "rate_limited");
 
 		const failureReason = classifyExecutionFailure(result);
@@ -140,7 +140,7 @@ test("a stderr rate-limit report stops the provider early and resolves quota_exh
 			failurePhase: "execute",
 			providerResult: result,
 		});
-		strictEqual(reliability.causeCode, "quota_exhausted");
+		strictEqual(reliability.causeCode, "provider_signalled");
 		strictEqual(reliability.causeCategory, "provider");
 		strictEqual(reliability.phase, "provider");
 
@@ -149,7 +149,7 @@ test("a stderr rate-limit report stops the provider early and resolves quota_exh
 			phase: "execute",
 			providerResult: result,
 		});
-		strictEqual(resolved.causeCode, "quota_exhausted");
+		strictEqual(resolved.causeCode, "provider_signalled");
 		strictEqual(resolved.causeCategory, "provider");
 		strictEqual(resolved.providerCaused, true);
 	} finally {
