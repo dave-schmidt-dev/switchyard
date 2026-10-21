@@ -31,6 +31,23 @@ const quotaDiagnostic = () =>
 		causeCode: "quota_exhausted",
 		phase: "provider",
 	});
+const trustedQuotaFailure = () => {
+	const providerReliability = quotaDiagnostic();
+	return {
+		status: "failed",
+		result: { providerReliability },
+		record: {
+			lastFailure: {
+				errorKind: "execution_failed",
+				providerReliability,
+				diagnosticCode: "quota_exhausted",
+				diagnosticOrigin: "adapter",
+				diagnosticEvidenceAvailable: true,
+				failurePhase: "provider_execution",
+			},
+		},
+	};
+};
 
 // Route evidence target ids resolve through the roster; pin a minimal fixture
 // so the selection assertions do not depend on the host's real roster.
@@ -166,10 +183,7 @@ test("liveRouteExhaustion ignores malformed records and removes expired ones", (
 
 test("a quota_exhausted attempt marks the target exhausted for an hour", async () => {
 	const f = fixture({
-		"antigravity-claude": {
-			status: "failed",
-			result: { providerReliability: quotaDiagnostic() },
-		},
+		"antigravity-claude": trustedQuotaFailure(),
 	});
 	f.deps.now = () => NOW;
 	f.options.deadlineMs = NOW + 60_000;
@@ -210,10 +224,7 @@ test("non-quota failures write no exhaustion record", async () => {
 
 test("an exhaustion record write failure never changes the routing outcome", async () => {
 	const f = fixture({
-		"antigravity-claude": {
-			status: "failed",
-			result: { providerReliability: quotaDiagnostic() },
-		},
+		"antigravity-claude": trustedQuotaFailure(),
 	});
 	const warnings = [];
 	f.deps.onRoutingWarning = (message) => warnings.push(message);
@@ -232,10 +243,7 @@ test("an exhaustion record write failure never changes the routing outcome", asy
 test("an exhaustion record write failure with a throwing warning sink leaves the outcome unchanged", async () => {
 	const quotaFixture = () => {
 		const f = fixture({
-			"antigravity-claude": {
-				status: "failed",
-				result: { providerReliability: quotaDiagnostic() },
-			},
+			"antigravity-claude": trustedQuotaFailure(),
 		});
 		writeFileSync(
 			join(f.deps.stateRoot, "route-exhaustion"),

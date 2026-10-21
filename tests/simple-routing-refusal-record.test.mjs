@@ -152,14 +152,23 @@ function p6Fixture() {
 		{ name: "antigravity", ok: true, windows: [window(80)] },
 		{ name: "opencode-go", ok: true, windows: [window(90)] },
 	]);
+	const providerReliability = createProviderReliabilityDiagnostic({
+		causeCode: "quota_exhausted",
+		phase: "provider",
+	});
 	const f = fixture({
 		antigravity: {
 			status: "failed",
-			result: {
-				providerReliability: createProviderReliabilityDiagnostic({
-					causeCode: "quota_exhausted",
-					phase: "provider",
-				}),
+			result: { providerReliability },
+			record: {
+				lastFailure: {
+					errorKind: "execution_failed",
+					providerReliability,
+					diagnosticCode: "quota_exhausted",
+					diagnosticOrigin: "adapter",
+					diagnosticEvidenceAvailable: true,
+					failurePhase: "provider_execution",
+				},
 			},
 		},
 	});

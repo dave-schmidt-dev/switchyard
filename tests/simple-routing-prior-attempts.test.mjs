@@ -15,14 +15,25 @@ import { tempDir } from "./helpers/tempdir.mjs";
 // mid-task, the retry returned deferred native_required, and the answer
 // described only the retry; the first attempt's partial worktree was visible
 // only through `routing-run inspect`.
+const providerReliability = createProviderReliabilityDiagnostic({
+	causeCode: "quota_exhausted",
+	phase: "provider",
+});
 const quotaFailure = {
 	status: "failed",
 	retained: true,
 	result: {
-		providerReliability: createProviderReliabilityDiagnostic({
-			causeCode: "quota_exhausted",
-			phase: "provider",
-		}),
+		providerReliability,
+	},
+	record: {
+		lastFailure: {
+			errorKind: "execution_failed",
+			providerReliability,
+			diagnosticCode: "quota_exhausted",
+			diagnosticOrigin: "adapter",
+			diagnosticEvidenceAvailable: true,
+			failurePhase: "provider_execution",
+		},
 	},
 };
 
