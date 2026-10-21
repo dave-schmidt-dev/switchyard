@@ -6,6 +6,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Changed
 
+- Codex can complete its native request backoff and retries without Switchyard terminating it on rate-limit-like output; the existing provider deadline and cancellation still apply.
 - Shared quota markers and provider-health effects require matching authoritative adapter evidence; unverified reports remain local to the current task. Marker and cooldown durations remain unchanged.
 - Task retry suppression remains separate from global provider blame: check, policy and unknown failures do not become provider faults.
 - Held integration supports reports, captured dirty overlays and durable applied-output predecessor receipts.

@@ -69,10 +69,18 @@ function defaultProviderContext({
 
 test("quota-like Codex stream classifications remain unverified", async () => {
 	const cases = [
-		{ label: "stdout classifier", stdout: "Quota exhausted\n" },
-		{ label: "stderr classifier", stderr: "Quota exhausted\n" },
 		{
-			label: "early stream matcher",
+			label: "stdout classifier",
+			stdout: "Quota exhausted\n",
+			diagnosticCode: "quota_exhausted",
+		},
+		{
+			label: "stderr classifier",
+			stderr: "Quota exhausted\n",
+			diagnosticCode: "quota_exhausted",
+		},
+		{
+			label: "native retry wording",
 			stderr: "429 Too Many Requests: rate limit exceeded\n",
 		},
 		{
@@ -86,9 +94,18 @@ test("quota-like Codex stream classifications remain unverified", async () => {
 			defaultProviderContext({ spawnFn: fakeProviderChild(row) }),
 		);
 		strictEqual(result.success, false, row.label);
-		strictEqual(result.diagnosticCode, "quota_exhausted", row.label);
-		strictEqual(result.diagnosticOrigin, "adapter", row.label);
-		strictEqual(result.diagnosticEvidenceAvailable, false, row.label);
+		strictEqual(result.rateLimited, false, row.label);
+		strictEqual(result.diagnosticCode, row.diagnosticCode, row.label);
+		strictEqual(
+			result.diagnosticOrigin,
+			row.diagnosticCode ? "adapter" : undefined,
+			row.label,
+		);
+		strictEqual(
+			result.diagnosticEvidenceAvailable,
+			row.diagnosticCode ? false : undefined,
+			row.label,
+		);
 	}
 });
 

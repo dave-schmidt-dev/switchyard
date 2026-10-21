@@ -1,18 +1,13 @@
 // @test-phase: other
-import { ok, strictEqual } from "node:assert";
+import { strictEqual } from "node:assert";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { test } from "node:test";
-import { resolveFailure } from "../src/switchyard/diagnostics/failure-registry.mjs";
-import {
-	classifyExecutionFailure,
-	defaultExecuteProvider,
-} from "../src/switchyard/simple/provider-invocation.mjs";
+import { defaultExecuteProvider } from "../src/switchyard/simple/provider-invocation.mjs";
 import {
 	createRateLimitMatcher,
 	RATE_LIMIT_TAIL_BYTES,
 } from "../src/switchyard/simple/provider-signature.mjs";
-import { createSimpleProviderReliabilityDiagnostic } from "../src/switchyard/simple/reliability.mjs";
 import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 
 const CODEX_DESCRIPTOR = Object.freeze({
@@ -107,54 +102,79 @@ test("streaming matcher bounds the tail and ignores the echoed prompt", () => {
 	strictEqual(plain.push("stdout", "upstream_status=429\n"), true);
 });
 
-test("a stderr rate-limit report stops early without trusted quota evidence", async () => {
+test("Codex can back off and retry after rate-limit reports without being terminated", async () => {
 	const children = [];
 	try {
-		const startedAt = Date.now();
 		const result = await defaultExecuteProvider(
 			providerContext({
-				timeoutMs: 2 * HANG_GUARD_MS,
+				timeoutMs: HANG_GUARD_MS,
 				spawnFn: nodeProvider(
-					'process.stderr.write("429 Too Many Requests: rate limit exceeded\\n");\nsetTimeout(() => process.exit(0), 300_000);\n',
+					'process.stderr.write("429 Too Many Requests: retrying after backoff\\n");\nsetTimeout(() => { process.stderr.write("retrying after another rate limit\\n"); setTimeout(() => { process.stdout.write("completed after retries\\n"); }, 40); }, 20);\n',
 					children,
 				),
 			}),
 		);
-		const elapsedMs = Date.now() - startedAt;
-		// Under the provider timeout and child lifetime, so a provider that was
-		// not stopped early fails, but at the hang guard so a loaded host's
-		// process-launch stalls cannot.
-		ok(elapsedMs < HANG_GUARD_MS, `provider stopped after ${elapsedMs}ms`);
-
-		strictEqual(result.success, false);
-		strictEqual(result.rateLimited, true);
-		strictEqual(result.terminationReason, "rate_limited");
-		strictEqual(result.diagnosticCode, "quota_exhausted");
-		strictEqual(result.diagnosticOrigin, "adapter");
-		strictEqual(result.diagnosticEvidenceAvailable, false);
-		strictEqual(result.providerSignature, "rate_limited");
-
-		const failureReason = classifyExecutionFailure(result);
-		const reliability = createSimpleProviderReliabilityDiagnostic({
-			failureReason,
-			failurePhase: "execute",
-			providerResult: result,
-		});
-		strictEqual(reliability.causeCode, "provider_signalled");
-		strictEqual(reliability.causeCategory, "provider");
-		strictEqual(reliability.phase, "provider");
-
-		const resolved = resolveFailure({
-			reason: failureReason,
-			phase: "execute",
-			providerResult: result,
-		});
-		strictEqual(resolved.causeCode, "provider_signalled");
-		strictEqual(resolved.causeCategory, "provider");
-		strictEqual(resolved.providerCaused, true);
+		strictEqual(children.length, 1);
+		strictEqual(result.success, true);
+		strictEqual(result.rateLimited, false);
+		strictEqual(result.terminationReason, "completed");
+		strictEqual(result.output, "completed after retries\n");
+		strictEqual(result.diagnosticCode, undefined);
 	} finally {
 		releaseChildren(children);
 	}
+});
+
+function pendingRateLimitedChild({ onReport = () => {}, onKill }) {
+	const child = new EventEmitter();
+	child.stdout = new EventEmitter();
+	child.stderr = new EventEmitter();
+	child.stdin = { end() {} };
+	child.kill = (signal) => {
+		onKill(signal);
+		queueMicrotask(() => child.emit("close", null, signal));
+		return true;
+	};
+	queueMicrotask(() => {
+		child.stderr.emit("data", Buffer.from("429 Too Many Requests; retrying\n"));
+		onReport();
+	});
+	return child;
+}
+
+test("Codex rate-limit backoff remains bounded by the provider deadline", async () => {
+	const signals = [];
+	const result = await defaultExecuteProvider(
+		providerContext({
+			timeoutMs: 40,
+			spawnFn: () =>
+				pendingRateLimitedChild({ onKill: (s) => signals.push(s) }),
+		}),
+	);
+	strictEqual(result.success, false);
+	strictEqual(result.timedOut, true);
+	strictEqual(result.rateLimited, false);
+	strictEqual(result.terminationReason, "deadline");
+	strictEqual(signals[0], "SIGTERM");
+});
+
+test("cancellation interrupts Codex rate-limit backoff", async () => {
+	const controller = new AbortController();
+	const signals = [];
+	const context = providerContext({
+		spawnFn: () =>
+			pendingRateLimitedChild({
+				onReport: () => controller.abort("SIGTERM"),
+				onKill: (s) => signals.push(s),
+			}),
+	});
+	context.signal = controller.signal;
+	const result = await defaultExecuteProvider(context);
+	strictEqual(result.success, false);
+	strictEqual(result.cancelled, true);
+	strictEqual(result.rateLimited, false);
+	strictEqual(result.terminationReason, "cancelled");
+	strictEqual(signals[0], "SIGTERM");
 });
 
 test("stdout rate-limit words in a successful run are unaffected", async () => {

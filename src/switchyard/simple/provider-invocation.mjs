@@ -403,9 +403,10 @@ export async function defaultExecuteProvider(context) {
 		onStderrChunk: context.onStderrChunk,
 		onProviderLaunch: context.onProviderLaunch,
 		signal: context.signal,
-		// This fixed bridge buffers child output until it exits, then emits the
-		// parent receipt; early matching would invalidate its closed lifecycle.
-		...(fixedOpenCodeGoBridgeInvocation
+		// Codex owns request backoff/retries within this supervised process.
+		// The fixed bridge buffers child output until its closed parent receipt.
+		// Stream wording must not interrupt either path; deadlines still apply.
+		...(context.harness === "codex" || fixedOpenCodeGoBridgeInvocation
 			? { detectRateLimit: () => false }
 			: {}),
 		...(context.spawnFn ? { spawnFn: context.spawnFn } : {}),
